@@ -1,0 +1,15 @@
+# Secrets and local config
+backends.json
+
+# Runtime-generated files (Caddyfile, TLS certs, PIDs, logs)
+.runtime/
+gateway.pid
+gateway.log
+*.log
+
+# Node dependencies
+node_modules/
+
+# Temporary files
+tmp/
+*.tmp

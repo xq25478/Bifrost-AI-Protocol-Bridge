@@ -1,0 +1,19 @@
+{
+  "name": "bifrost-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal desktop AI protocol bridge between Anthropic and OpenAI clients",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test src/**/*.test.js",
+    "lint": "node -c index.js && node -e 'const mods=[\"config\",\"logger\",\"metrics\",\"backend\",\"thinking\",\"converters\",\"handlers\",\"http_utils\",\"usage_recorder\"];mods.forEach(m=>require(\"./src/\"+m))'"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.9.0",
+    "undici": "^6.22.0"
+  }
+}
