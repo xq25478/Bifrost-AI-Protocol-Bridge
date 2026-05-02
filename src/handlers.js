@@ -47,6 +47,7 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
   // usage data in streaming responses (needed for token accounting).
   const openaiBodyStr = injectStreamOptions(JSON.stringify(openaiBody));
   const openaiBuf = Buffer.from(openaiBodyStr);
+  if (typeof ctx.attachBody === "function") ctx.attachBody(openaiBuf);
 
   const backendUrl = new URL("/v1/chat/completions", backend.baseUrl.replace("/v1", ""));
 
@@ -59,7 +60,7 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
 
   let up;
   try {
-    up = await doUpstream(backendUrl, { method: "POST", headers, body: openaiBuf }, backend);
+    up = await doUpstream(backendUrl, { method: "POST", headers, body: openaiBuf }, backend, ctx);
   } catch (err) {
     incMetric("upstream_errors");
     const status = upstreamErrStatus(err);
@@ -75,6 +76,9 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
       "access-control-allow-origin": "*"
+    });
+    res.on("close", () => {
+      if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
     });
     const msgId = "msg_" + crypto.randomUUID();
     const model = body.model || "";
@@ -181,6 +185,7 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
   if (upstreamUrl.searchParams.has("beta")) upstreamUrl.searchParams.delete("beta");
 
   const bodyBuf = Buffer.from(JSON.stringify(anthropicBody));
+  if (typeof ctx.attachBody === "function") ctx.attachBody(bodyBuf);
 
   const headers = {
     "content-type": "application/json",
@@ -192,7 +197,7 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
 
   let up;
   try {
-    up = await doUpstream(upstreamUrl, { method: "POST", headers, body: bodyBuf }, backend);
+    up = await doUpstream(upstreamUrl, { method: "POST", headers, body: bodyBuf }, backend, ctx);
   } catch (err) {
     incMetric("upstream_errors");
     const status = upstreamErrStatus(err);
@@ -208,6 +213,9 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
       "access-control-allow-origin": "*"
+    });
+    res.on("close", () => {
+      if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
     });
     const chatId = "chatcmpl-" + crypto.randomUUID().replace(/-/g, "").slice(0, 24);
     const model = anthropicBody.model || "";
@@ -293,6 +301,7 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
 async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
   const injectedStr = injectStreamOptions(bodyStr);
   const bodyBuf = Buffer.from(injectedStr);
+  if (typeof ctx.attachBody === "function") ctx.attachBody(bodyBuf);
 
   const backendUrl = new URL("/v1/chat/completions", backend.baseUrl.replace("/v1", ""));
 
@@ -305,7 +314,7 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
 
   let up;
   try {
-    up = await doUpstream(backendUrl, { method: "POST", headers, body: bodyBuf }, backend);
+    up = await doUpstream(backendUrl, { method: "POST", headers, body: bodyBuf }, backend, ctx);
   } catch (err) {
     incMetric("upstream_errors");
     const status = upstreamErrStatus(err);
@@ -321,7 +330,10 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
     if (!HOP_BY_HOP.has(k.toLowerCase())) cleanHeaders[k] = v;
   }
   res.writeHead(statusCode || 502, cleanHeaders);
-  res.on("close", () => { finish(); });
+  res.on("close", () => {
+    finish();
+    if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
+  });
 
   if (isStream) {
     let buf = null;
@@ -385,8 +397,9 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
     let responseLen = 0;
     upstreamBody.on("data", chunk => { responseChunks.push(chunk); responseLen += chunk.length; });
     upstreamBody.on("end", () => {
+      const buf = Buffer.concat(responseChunks, responseLen);
       try {
-        const parsed = JSON.parse(Buffer.concat(responseChunks, responseLen).toString("utf8"));
+        const parsed = JSON.parse(buf.toString("utf8"));
         const norm = normalizeUsage(parsed.usage);
         if (norm.input_tokens || norm.output_tokens) {
           ctx.attachUsage(norm, {
@@ -396,7 +409,7 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
           });
         }
       } catch {}
-      res.end();
+      res.end(buf);
       onBackendSuccess(backend);
       ctx.end(statusCode || 502, { backend: backend.provider });
       finish();
@@ -424,6 +437,7 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
   if (upstreamUrl.searchParams.has("beta")) upstreamUrl.searchParams.delete("beta");
 
   const bodyBuf = bodyStr ? Buffer.from(bodyStr) : undefined;
+  if (bodyBuf && typeof ctx.attachBody === "function") ctx.attachBody(bodyBuf);
 
   let isStream = false;
   if (bodyStr) {
@@ -445,7 +459,7 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
 
   let up;
   try {
-    up = await doUpstream(upstreamUrl, { method: req.method, headers, body: bodyBuf }, backend);
+    up = await doUpstream(upstreamUrl, { method: req.method, headers, body: bodyBuf }, backend, ctx);
   } catch (err) {
     incMetric("upstream_errors");
     const status = upstreamErrStatus(err);
@@ -460,7 +474,10 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
     if (!HOP_BY_HOP.has(k.toLowerCase())) cleanHeaders[k] = v;
   }
   res.writeHead(statusCode || 502, cleanHeaders);
-  res.on("close", () => { finish(); });
+  res.on("close", () => {
+    finish();
+    if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
+  });
 
   if (isStream) {
     let buf = null;
@@ -508,8 +525,9 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
     let responseLen = 0;
     upstreamBody.on("data", chunk => { responseChunks.push(chunk); responseLen += chunk.length; });
     upstreamBody.on("end", () => {
+      const buf = Buffer.concat(responseChunks, responseLen);
       try {
-        const parsed = JSON.parse(Buffer.concat(responseChunks, responseLen).toString("utf8"));
+        const parsed = JSON.parse(buf.toString("utf8"));
         const norm = normalizeUsage(parsed.usage);
         if (norm.input_tokens || norm.output_tokens) {
           ctx.attachUsage(norm, {
@@ -519,7 +537,7 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
           });
         }
       } catch {}
-      res.end();
+      res.end(buf);
       onBackendSuccess(backend);
       ctx.end(statusCode || 502, { backend: backend.provider });
       finish();
@@ -541,4 +559,6 @@ module.exports = {
   proxyAnthropicAsOpenAI,
   proxyOpenAIDirect,
   proxyRequest,
+  // exposed for unit tests
+  _injectStreamOptions: injectStreamOptions,
 };

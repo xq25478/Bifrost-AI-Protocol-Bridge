@@ -92,3 +92,60 @@ describe("backend - upstreamErrStatus", () => {
     assert.strictEqual(upstreamErrStatus({ message: "unknown" }), 502);
   });
 });
+
+describe("backend - validateBackends", () => {
+  const { validateBackends } = require("./backend");
+
+  it("rejects non-array root", () => {
+    assert.strictEqual(validateBackends(null).ok, false);
+    assert.strictEqual(validateBackends({}).ok, false);
+    assert.strictEqual(validateBackends("x").ok, false);
+  });
+
+  it("rejects empty array", () => {
+    const r = validateBackends([]);
+    assert.strictEqual(r.ok, false);
+    assert.match(r.errors[0], /at least one/);
+  });
+
+  it("rejects unknown type", () => {
+    const r = validateBackends([{ type: "bedrock", provider: "p", baseUrl: "https://x", models: ["m"] }]);
+    assert.strictEqual(r.ok, false);
+    assert.ok(r.errors.some(e => /type must be/.test(e)));
+  });
+
+  it("rejects bad URL", () => {
+    const r = validateBackends([{ type: "openai", provider: "p", baseUrl: "not-a-url", models: ["m"] }]);
+    assert.strictEqual(r.ok, false);
+    assert.ok(r.errors.some(e => /baseUrl/.test(e)));
+  });
+
+  it("rejects empty models", () => {
+    const r = validateBackends([{ type: "openai", provider: "p", baseUrl: "https://x", models: [] }]);
+    assert.strictEqual(r.ok, false);
+    assert.ok(r.errors.some(e => /non-empty array/.test(e)));
+  });
+
+  it("rejects non-string model entries", () => {
+    const r = validateBackends([{ type: "openai", provider: "p", baseUrl: "https://x", models: [42, ""] }]);
+    assert.strictEqual(r.ok, false);
+    assert.ok(r.errors.some(e => /non-empty strings/.test(e)));
+  });
+
+  it("accepts a well-formed config", () => {
+    const r = validateBackends([
+      { type: "anthropic", provider: "A", baseUrl: "https://api.anthropic.com", apiKey: "sk-x", models: ["claude"] },
+      { type: "openai", provider: "B", baseUrl: "http://localhost/v1", models: ["m1", "m2"] },
+    ]);
+    assert.strictEqual(r.ok, true, r.errors.join("; "));
+    assert.strictEqual(r.errors.length, 0);
+  });
+
+  it("tolerates duplicate models across backends (loader will dedupe)", () => {
+    const r = validateBackends([
+      { type: "openai", provider: "A", baseUrl: "http://x", models: ["dup"] },
+      { type: "openai", provider: "B", baseUrl: "http://y", models: ["dup"] },
+    ]);
+    assert.strictEqual(r.ok, true);
+  });
+});

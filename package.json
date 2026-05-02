@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node index.js",
     "test": "node --test src/**/*.test.js",
-    "lint": "node -c index.js && node -e 'const mods=[\"config\",\"logger\",\"metrics\",\"backend\",\"thinking\",\"converters\",\"handlers\",\"http_utils\",\"usage_recorder\"];mods.forEach(m=>require(\"./src/\"+m))'"
+    "lint": "node scripts/lint.js"
   },
   "engines": {
     "node": ">=18.17"

@@ -50,8 +50,11 @@ function isTransientConnectError(err) {
 /**
  * Call an upstream URL with automatic retry on transient connection errors.
  * Returns { statusCode, headers, body, finish, signal }.
+ *
+ * If `ctx` is provided, emits an "upstream" event before the call and tracks
+ * upstream call timing for the request log.
  */
-async function doUpstream(url, options, backend) {
+async function doUpstream(url, options, backend, ctx) {
   const ac = new AbortController();
   inFlightAbortControllers.add(ac);
   const timeout = setTimeout(() => ac.abort("timeout"), TIMEOUT);
@@ -61,6 +64,11 @@ async function doUpstream(url, options, backend) {
   };
   const call = () => undiciRequest(url, { ...options, signal: ac.signal, dispatcher });
 
+  if (ctx && typeof ctx.markUpstream === "function") ctx.markUpstream("start");
+  if (ctx && typeof ctx.on === "function") {
+    ctx.on("upstream", { backend: backend && backend.provider, url: String(url) });
+  }
+
   let r;
   try {
     r = await call();
@@ -69,54 +77,157 @@ async function doUpstream(url, options, backend) {
       try {
         r = await call();
       } catch (err2) {
+        if (ctx && typeof ctx.markUpstream === "function") ctx.markUpstream("end");
         finish();
         onBackendError(backend);
         throw err2;
       }
     } else {
+      if (ctx && typeof ctx.markUpstream === "function") ctx.markUpstream("end");
       finish();
       onBackendError(backend);
       throw err;
     }
   }
+  if (ctx && typeof ctx.markUpstream === "function") ctx.markUpstream("end");
   return { statusCode: r.statusCode, headers: r.headers, body: r.body, finish, signal: ac.signal };
 }
 
-function loadBackends() {
-  try {
-    const raw = fs.readFileSync(BACKENDS_PATH, "utf8");
-    const configs = JSON.parse(raw);
-
-    backends = configs.map((cfg, idx) => ({ ...cfg, index: idx }));
-
-    modelIndex = {};
-    modelList = [];
-
-    for (const backend of backends) {
-      for (let mi = 0; mi < backend.models.length; mi++) {
-        const modelId = backend.models[mi];
-        if (modelIndex[modelId]) {
-          system("warn", `duplicate model id "${modelId}" in ${backend.provider} — first occurrence in ${modelIndex[modelId].backend.provider} wins, skipped`,
-            { backend: backend.provider, model: modelId });
-          continue;
+/**
+ * Validate a parsed backends array. Returns { ok, errors[] }.
+ * Pure function — does not touch module-level state.
+ */
+function validateBackends(arr) {
+  const errors = [];
+  if (!Array.isArray(arr)) {
+    return { ok: false, errors: ["root must be an array"] };
+  }
+  if (arr.length === 0) {
+    return { ok: false, errors: ["at least one backend is required"] };
+  }
+  const seenModels = new Set();
+  for (let i = 0; i < arr.length; i++) {
+    const b = arr[i];
+    const tag = `backend[${i}]` + (b && b.provider ? ` (${b.provider})` : "");
+    if (!b || typeof b !== "object") { errors.push(`${tag}: must be an object`); continue; }
+    if (b.type !== "anthropic" && b.type !== "openai") {
+      errors.push(`${tag}: type must be "anthropic" or "openai", got ${JSON.stringify(b.type)}`);
+    }
+    if (typeof b.provider !== "string" || !b.provider.trim()) {
+      errors.push(`${tag}: provider must be a non-empty string`);
+    }
+    if (typeof b.baseUrl !== "string" || !b.baseUrl.trim()) {
+      errors.push(`${tag}: baseUrl must be a non-empty string`);
+    } else {
+      try { new URL(b.baseUrl); }
+      catch { errors.push(`${tag}: baseUrl is not a valid URL: ${b.baseUrl}`); }
+    }
+    if (b.apiKey !== undefined && typeof b.apiKey !== "string") {
+      errors.push(`${tag}: apiKey must be a string when present`);
+    }
+    if (!Array.isArray(b.models) || b.models.length === 0) {
+      errors.push(`${tag}: models must be a non-empty array`);
+    } else {
+      for (const m of b.models) {
+        if (typeof m !== "string" || !m.trim()) {
+          errors.push(`${tag}: model entries must be non-empty strings, got ${JSON.stringify(m)}`);
+        } else if (seenModels.has(m)) {
+          // not a hard error — loadBackends will warn and skip duplicates
+        } else {
+          seenModels.add(m);
         }
-        modelIndex[modelId] = { backend, modelId };
-        modelList.push({
-          id: modelId,
-          type: "model",
-          display_name: modelId,
-          created_at: "2026-01-01T00:00:00Z"
-        });
       }
     }
+  }
+  return { ok: errors.length === 0, errors };
+}
 
-    system("info", `loaded ${backends.length} backends, ${modelList.length} models`);
-    availableModelsStr = modelList.map(m => m.id).join(", ");
-    return true;
+function loadBackends() {
+  let raw, configs;
+  try {
+    raw = fs.readFileSync(BACKENDS_PATH, "utf8");
   } catch (err) {
-    system("error", `failed to load backends: ${err.message}`);
+    system("error", `failed to read ${BACKENDS_PATH}: ${err.message}`);
     return false;
   }
+  try {
+    configs = JSON.parse(raw);
+  } catch (err) {
+    system("error", `backends.json is not valid JSON: ${err.message}`);
+    return false;
+  }
+  const v = validateBackends(configs);
+  if (!v.ok) {
+    system("error", `backends.json validation failed:\n  - ${v.errors.join("\n  - ")}`);
+    return false;
+  }
+
+  // Build new state in locals first so a partial failure cannot corrupt
+  // the live registry.
+  const newBackends = configs.map((cfg, idx) => ({ ...cfg, index: idx }));
+  const newIndex = {};
+  const newList = [];
+
+  for (const backend of newBackends) {
+    for (let mi = 0; mi < backend.models.length; mi++) {
+      const modelId = backend.models[mi];
+      if (newIndex[modelId]) {
+        system("warn", `duplicate model id "${modelId}" in ${backend.provider} — first occurrence in ${newIndex[modelId].backend.provider} wins, skipped`,
+          { backend: backend.provider, model: modelId });
+        continue;
+      }
+      newIndex[modelId] = { backend, modelId };
+      newList.push({
+        id: modelId,
+        type: "model",
+        display_name: modelId,
+        created_at: "2026-01-01T00:00:00Z"
+      });
+    }
+  }
+
+  // Atomic swap.
+  backends = newBackends;
+  modelIndex = newIndex;
+  modelList = newList;
+  availableModelsStr = newList.map(m => m.id).join(", ");
+
+  system("info", `loaded ${backends.length} backends, ${modelList.length} models`);
+  return true;
+}
+
+let watchHandle = null;
+let watchDebounce = null;
+
+/**
+ * Start watching backends.json for changes. Reloads on modification (with a
+ * 250ms debounce). Safe to call multiple times — only one watcher is kept.
+ * Returns the underlying fs.FSWatcher (or null when watch fails).
+ */
+function watchBackends(onReload) {
+  if (watchHandle) return watchHandle;
+  try {
+    watchHandle = fs.watch(BACKENDS_PATH, { persistent: false }, (eventType) => {
+      if (eventType !== "change" && eventType !== "rename") return;
+      if (watchDebounce) clearTimeout(watchDebounce);
+      watchDebounce = setTimeout(() => {
+        const ok = loadBackends();
+        if (typeof onReload === "function") {
+          try { onReload(ok); } catch {}
+        }
+      }, 250);
+    });
+    system("info", `watching ${BACKENDS_PATH} for changes`);
+  } catch (err) {
+    system("warn", `failed to watch ${BACKENDS_PATH}: ${err.message}`);
+    watchHandle = null;
+  }
+  return watchHandle;
+}
+
+function stopWatchBackends() {
+  if (watchDebounce) { clearTimeout(watchDebounce); watchDebounce = null; }
+  if (watchHandle) { try { watchHandle.close(); } catch {} watchHandle = null; }
 }
 
 function resolveApiKey(req, backendApiKey) {
@@ -144,6 +255,9 @@ module.exports = {
   modelList: () => modelList,
   availableModelsStr: () => availableModelsStr,
   loadBackends,
+  validateBackends,
+  watchBackends,
+  stopWatchBackends,
   doUpstream,
   upstreamErrStatus,
   isCircuitOpen,
@@ -158,5 +272,6 @@ module.exports = {
     modelList = [];
     availableModelsStr = "";
     inFlightAbortControllers.clear();
+    stopWatchBackends();
   },
 };

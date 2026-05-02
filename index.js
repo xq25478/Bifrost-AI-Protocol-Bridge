@@ -6,7 +6,7 @@ const { system, requestlog } = require("./src/logger");
 const { incMetric, metricsSnapshot } = require("./src/metrics");
 const {
   backends, modelIndex, modelList, availableModelsStr,
-  loadBackends, isCircuitOpen, abortAllInFlight,
+  loadBackends, watchBackends, isCircuitOpen, abortAllInFlight,
   doUpstream, upstreamErrStatus, resolveApiKey,
   onBackendError, onBackendSuccess,
 } = require("./src/backend");
@@ -24,10 +24,52 @@ const {
 let store = null;
 try { store = require("./src/store"); } catch {}
 
+// Pre-render dashboard HTML once at startup. The output is a static string
+// so we avoid re-running the builder on every request.
+const { dashboardHtml: _dashboardHtmlBuilder } = require("./src/dashboard_html");
+const DASHBOARD_HTML = _dashboardHtmlBuilder();
+const DASHBOARD_HTML_BYTES = Buffer.byteLength(DASHBOARD_HTML, "utf8");
+
 loadBackends();
+watchBackends((ok) => {
+  if (ok) system("info", "backends.json reloaded");
+  else system("warn", "backends.json reload failed (validation or syntax error) — keeping previous config");
+});
 if (store && typeof store.open === "function") {
   store.open();
   setInterval(() => { if (store && store.prune) store.prune(); }, 3600_000);
+}
+
+// Maximum dashboard query window (90 days). Queries outside this range are
+// clamped to "to - MAX_QUERY_RANGE_MS .. to" to bound SQLite scan cost.
+const MAX_QUERY_RANGE_MS = 90 * 24 * 3600 * 1000;
+
+function parseDashboardRange(searchParams) {
+  const now = Date.now();
+  let to = parseInt(searchParams.get("to") || String(now), 10);
+  let from = parseInt(searchParams.get("from") || "0", 10);
+  if (!Number.isFinite(to) || to <= 0) to = now;
+  if (!Number.isFinite(from) || from < 0) from = 0;
+  if (from > to) [from, to] = [to, from];
+  let clamped = false;
+  if (to - from > MAX_QUERY_RANGE_MS) {
+    from = to - MAX_QUERY_RANGE_MS;
+    clamped = true;
+  }
+  return { from, to, clamped };
+}
+
+function buildDashboardBody(searchParams) {
+  const { from, to, clamped } = parseDashboardRange(searchParams);
+  const totals = (store && store.queryTotals) ? store.queryTotals(from, to) : null;
+  const models = (store && store.queryAggregated) ? store.queryAggregated(from, to) : [];
+  const body = {
+    totals: totals || {},
+    models: models || [],
+    range: { from, to, clamped, max_range_ms: MAX_QUERY_RANGE_MS },
+  };
+  if (!store) body._store_unavailable = true;
+  return body;
 }
 
 // ---- Dashboard server (separate port, no risk of gateway route conflict) ----
@@ -38,20 +80,18 @@ const dashboardServer = http.createServer((req, res) => {
   const dp = requestUrl.pathname;
 
   if (req.method === "GET" && dp === "/") {
-    const { dashboardHtml } = require("./src/dashboard_html");
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "access-control-allow-origin": "*" });
-    res.end(dashboardHtml());
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "content-length": DASHBOARD_HTML_BYTES,
+      "access-control-allow-origin": "*",
+    });
+    res.end(DASHBOARD_HTML);
     return;
   }
 
 
   if (req.method === "GET" && dp === "/api") {
-    const from = parseInt(requestUrl.searchParams.get("from") || "0", 10);
-    const to = parseInt(requestUrl.searchParams.get("to") || String(Date.now()), 10);
-    const totals = (store && store.queryTotals) ? store.queryTotals(from, to) : null;
-    const models = (store && store.queryAggregated) ? store.queryAggregated(from, to) : [];
-    const body = { totals: totals || {}, models: models || [] };
-    if (!store) body._store_unavailable = true;
+    const body = buildDashboardBody(requestUrl.searchParams);
     res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*" });
     res.end(JSON.stringify(body));
     return;
@@ -79,7 +119,7 @@ const server = http.createServer((req, res) => {
   const requestId = crypto.randomUUID().slice(0, 8);
   const requestUrl = new URL(req.url, "http://127.0.0.1");
   const requestPath = requestUrl.pathname;
-  const isHealth = (requestPath === "/" || requestPath === "/anthropic") && (req.method === "GET" || req.method === "HEAD");
+  const isHealth = (requestPath === "/" || requestPath === "/anthropic" || requestPath === "/healthz" || requestPath === "/readyz") && (req.method === "GET" || req.method === "HEAD");
   const ctx = requestlog(isHealth ? "" : requestId, req.method, req.url);
 
   if (!isHealth) incMetric("requests_total");
@@ -101,6 +141,32 @@ const server = http.createServer((req, res) => {
     ctx.mute();
     return;
   }
+
+  // /healthz — process is alive (cheap, no dependencies checked)
+  if ((req.method === "GET" || req.method === "HEAD") && requestPath === "/healthz") {
+    ctx.mute();
+    if (req.method === "HEAD") { res.writeHead(200); return res.end(); }
+    return json(res, 200, { status: "ok", uptime_s: Math.floor(process.uptime()) });
+  }
+
+  // /readyz — checks dependencies: at least one backend not in open circuit,
+  // and (if compiled) sqlite store is open.
+  if ((req.method === "GET" || req.method === "HEAD") && requestPath === "/readyz") {
+    ctx.mute();
+    const allBackends = backends();
+    const healthyBackends = allBackends.filter(b => !isCircuitOpen(b));
+    const storeOk = !store || (store && typeof store.queryTotals === "function");
+    const ready = healthyBackends.length > 0 && storeOk;
+    const code = ready ? 200 : 503;
+    if (req.method === "HEAD") { res.writeHead(code); return res.end(); }
+    return json(res, code, {
+      status: ready ? "ready" : "not_ready",
+      backends: { total: allBackends.length, healthy: healthyBackends.length },
+      models: modelList().length,
+      store: store ? "ok" : "unavailable",
+    });
+  }
+
   if (req.method === "GET" && (requestPath === "/" || requestPath === "/anthropic")) {
     ctx.end(200);
     // Browser visiting the gateway port — show a hint
@@ -117,21 +183,19 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "GET" && requestPath === "/dashboard/api") {
-    const from = parseInt(requestUrl.searchParams.get("from") || "0", 10);
-    const to = parseInt(requestUrl.searchParams.get("to") || String(Date.now()), 10);
-    const totals = (store && store.queryTotals) ? store.queryTotals(from, to) : null;
-    const models = (store && store.queryAggregated) ? store.queryAggregated(from, to) : [];
-    const body = { totals: totals || {}, models: models || [] };
-    if (!store) body._store_unavailable = true;
+    const body = buildDashboardBody(requestUrl.searchParams);
     ctx.end(200);
     return json(res, 200, body);
   }
 
   if (req.method === "GET" && requestPath === "/dashboard") {
-    const { dashboardHtml } = require("./src/dashboard_html");
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "access-control-allow-origin": "*" });
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "content-length": DASHBOARD_HTML_BYTES,
+      "access-control-allow-origin": "*",
+    });
     ctx.end(200);
-    return res.end(dashboardHtml());
+    return res.end(DASHBOARD_HTML);
   }
 
 
