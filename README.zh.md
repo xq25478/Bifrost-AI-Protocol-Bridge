@@ -74,18 +74,18 @@
 
 - **协议无关**：OpenAI SDK / Anthropic SDK / Claude Code Desktop / curl / LangChain / LiteLLM / Cursor / Continue.dev 皆可接入
 - **模型无关**：Claude、GPT、DeepSeek、通义、Moonshot、GLM、Ollama 等统一入口
-- **路径无关**：同一网关同时监听 `/v1/messages` 和 `/v1/chat/completions`
+- **路径无关**：同一网关同时监听 `/v1/messages`、`/v1/chat/completions` 和 `/v1/responses`（OpenAI Responses API）
 - **极简依赖**：`undici` 负责 HTTP 请求转发 + `better-sqlite3` 负责 Token 持久化存储，一次性 `npm install`
 - **模块化代码**：`src/` 目录下清晰拆分为 config、logger、metrics、converters、handlers 等模块
 - **协议双向转换**：流式 SSE、tool calls、图片、system prompt、usage 全链路保留
 - **本地 HTTPS**：mkcert + Caddy，证书受系统信任
 - **进程守护**：自带健康检查、自动重启、优雅关闭（30s 排空）
 - **可观测**：结构化日志（TTY 中文彩色 / 管道 JSON）+ Metrics 端点（P50/P95/P99、Token 统计）
-- **使用量仪表板**：内置 Web UI（`/_dashboard`）— 按模型统计 Token 总量、缓存命中、TTFT、ITL、QPS、Token/s，Chart.js 可视化 + 时间段筛选
+- **使用量仪表板**：内置 Web UI（`/_dashboard`）— 按模型统计 Token 总量、缓存命中、TTFT、ITL、QPS、Token/s，内联 SVG 图表（无外部 JS）+ 时间段筛选
 - **持久化存储**：SQLite（WAL 模式 + 批量写入）+ 365 天数据保留 — 重启不丢数据
 - **精确 Token 采集**：通过 API 响应数据捕获全部 8 个路径组合的用量（含流式/非流式、直传/转换），杜绝漏统
 - **Thinking 适配**：自动将 `thinking.enabled` 规范化为 AWS Bedrock 兼容的 `adaptive`
-- **测试覆盖**：115 个单元测试覆盖转换器、thinking、指标、token 估算、使用量记录、SSE 解析和熔断器
+- **测试覆盖**：194 个单元测试，涵盖转换器（Chat ↔ Anthropic、Responses ↔ Chat）、thinking、指标、token 估算、使用量记录、SSE 解析、熔断器、启动 Banner、以及持久化存储的 schema 容错
 
 ## 快速开始
 
@@ -248,6 +248,8 @@ Models (5 total):
 |:---------:|:---------:|:--------:|:--------|
 | **OpenAI** `/v1/chat/completions` | `anthropic` | **协议转换** | OpenAI SDK 调用 Claude |
 | **OpenAI** `/v1/chat/completions` | `openai` | 直传 | OpenAI SDK 调用 GPT / DeepSeek |
+| **OpenAI** `/v1/responses` | `openai` | **协议转换**（Responses → Chat） | Codex / OpenAI SDK (Responses) 调用 GPT / DeepSeek |
+| **OpenAI** `/v1/responses` | `anthropic` | **协议转换**（Responses → Chat → Anthropic） | Codex / OpenAI SDK (Responses) 调用 Claude |
 | **Anthropic** `/v1/messages` | `anthropic` | 直传 | Claude Code Desktop 调用 Claude |
 | **Anthropic** `/v1/messages` | `openai` | **协议转换** | Claude Code Desktop 调用 GPT |
 
@@ -345,6 +347,33 @@ const resp = await client.chat.completions.create({
 });
 ```
 
+### OpenAI Responses SDK（兼容 Codex）
+
+base URL 与 Chat Completions 完全相同，SDK 会自动拼接 `/responses`：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://127.0.0.1:8443/anthropic/v1",
+    api_key="any-string",
+)
+
+# 用 Responses API 调用 GPT（原生协议）
+resp = client.responses.create(model="gpt-4o", input="你好")
+print(resp.output_text)
+
+# 用 Responses API 调用 Claude（Responses → Chat → Anthropic 自动转换）
+resp = client.responses.create(model="Claude-Opus-4.7", input="你好")
+print(resp.output_text)
+
+# 流式
+with client.responses.stream(model="gpt-4o", input="写一首诗") as stream:
+    for event in stream:
+        if event.type == "response.output_text.delta":
+            print(event.delta, end="")
+```
+
 ### Anthropic Python SDK
 
 ```python
@@ -406,7 +435,36 @@ curl -k https://127.0.0.1:8443/anthropic/v1/messages \
   -H 'Content-Type: application/json' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{"model":"gpt-4o","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}'
+
+# 5. OpenAI Responses 协议 → OpenAI 后端（Responses ↔ Chat 转换）
+curl -k https://127.0.0.1:8443/anthropic/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o","input":"hi"}'
+
+# 6. OpenAI Responses 协议 → Anthropic 后端（Responses → Chat → Anthropic 转换）
+curl -k https://127.0.0.1:8443/anthropic/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Claude-Opus-4.7","input":"hi"}'
 ```
+
+### OpenAI Responses API 说明
+
+`/v1/responses` 接收 OpenAI 最新的 Responses 请求体，并按标准顺序发出 Responses SSE 事件
+（`response.created` → `response.output_text.delta` → `response.completed` 等）。支持范围：
+
+| 能力 | 支持情况 |
+|---|---|
+| 字符串 `input` 以及数组形式的 input items（`message`、`function_call`、`function_call_output`） | ✅ |
+| `input_text` / `input_image` 内容段 | ✅ |
+| `instructions`（自动映射为首条 system 消息） | ✅ |
+| `tools`（函数工具，扁平结构）+ `tool_choice` + `parallel_tool_calls` | ✅ |
+| 流式 SSE，完整事件序列与单调递增的 `sequence_number` | ✅ |
+| `max_output_tokens`（内部重命名为 `max_tokens`） | ✅ |
+| `reasoning.effort`（透传给支持的模型） | ✅ |
+| `usage.input_tokens_details.cached_tokens` | ✅ |
+| 托管工具（`web_search_preview` / `file_search` / `code_interpreter`） | ❌ 静默丢弃 — 网关无状态 |
+| `store`、`previous_response_id` | ❌ 忽略 — 网关不保存 Response 状态（响应始终是 `store:false`, `previous_response_id:null`） |
+| `metadata` | ⚠️ 会原样回显在响应中，但不会持久化 |
 
 ### 其他支持 OpenAI 兼容协议的工具
 
@@ -704,6 +762,7 @@ Azure 的 URL 需带 deployment 名，且需要 `?api-version=...`。可在 `bas
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `POST` | `/anthropic/v1/chat/completions` | Chat Completions API |
+| `POST` | `/anthropic/v1/responses` | Responses API（支持流式、工具调用、图片、结构化输出） |
 
 ### 模型发现
 
@@ -902,8 +961,8 @@ openproxyrouter/
 │   ├── http_utils.js      # JSON 响应工具函数
 │   ├── usage_recorder.js  # Token 归一化 + 统一记录接缝
 │   ├── store.js           # SQLite 持久化：WAL 模式、批量写入、365 天保留、分析查询
-│   ├── dashboard_html.js  # Web 仪表板 UI（Chart.js、时间段筛选、逐模型指标）
-│   └── *.test.js          # 115 个单元测试
+│   ├── dashboard_html.js  # Web 仪表板 UI（内联 SVG 图表、时间段筛选、逐模型指标）
+│   └── *.test.js          # 194 个单元测试
 ├── start.sh               # 启动守护脚本（Heimdall）
 ├── package.json           # 声明 undici + better-sqlite3 依赖
 ├── backends.json          # 后端配置，gitignored（需手动创建）

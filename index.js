@@ -17,6 +17,9 @@ const {
   proxyOpenAIDirect, proxyRequest,
 } = require("./src/handlers");
 const {
+  proxyResponsesAsOpenAI, proxyResponsesAsAnthropic,
+} = require("./src/handlers_responses");
+const {
   PORT, MAX_BODY_SIZE, LOCAL_KEEP_ALIVE_TIMEOUT,
   LOCAL_HEADERS_TIMEOUT, TIMEOUT, SHUTDOWN_DRAIN_MS,
   ALLOWED_ORIGINS, ALLOWED_METHODS, ALLOWED_HEADERS,
@@ -28,6 +31,7 @@ try { store = require("./src/store"); } catch {}
 const { dashboardHtml: _dashboardHtmlBuilder } = require("./src/dashboard_html");
 const DASHBOARD_HTML = _dashboardHtmlBuilder();
 const DASHBOARD_HTML_BYTES = Buffer.byteLength(DASHBOARD_HTML, "utf8");
+const { buildStartupBanner } = require("./src/startup_banner");
 
 loadBackends();
 watchBackends((ok) => {
@@ -240,12 +244,12 @@ const server = http.createServer((req, res) => {
         return json(res, 501, { error: { type: "not_implemented", message: `count_tokens is only supported for Anthropic-type backends; model "${modelId}" is routed to ${backend.provider} (${backend.type})` } }, req);
       }
 
+      if (!requireApiKey(req, res, ctx, backend)) return;
+
       if (!tryAcquireCircuit(backend)) {
         ctx.end(503, { backend: backend.provider, msg: "circuit open" });
         return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } }, req);
       }
-
-      if (!requireApiKey(req, res, ctx, backend)) return;
 
       ctx.on("route", { backend: backend.provider, model: modelId });
 
@@ -333,12 +337,12 @@ const server = http.createServer((req, res) => {
       parsedBody.model = backendModelId;
       ctx.on("route", { backend: backend.provider, model: modelId });
 
+      if (!requireApiKey(req, res, ctx, backend)) return;
+
       if (!tryAcquireCircuit(backend)) {
         ctx.end(503, { backend: backend.provider, msg: "circuit open" });
         return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } }, req);
       }
-
-      if (!requireApiKey(req, res, ctx, backend)) return;
 
       if (backend.type === "openai") {
         const bodyStr = JSON.stringify(parsedBody);
@@ -346,6 +350,42 @@ const server = http.createServer((req, res) => {
       }
 
       return proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody);
+    }
+
+    if (requestPath === "/anthropic/v1/responses") {
+      if (!bodyBuf) {
+        ctx.end(400, { msg: "body required" });
+        return json(res, 400, { error: { type: "invalid_request_error", message: "Request body is required" } }, req);
+      }
+
+      let parsedBody;
+      try { parsedBody = JSON.parse(bodyBuf); } catch {
+        ctx.end(400, { msg: "invalid JSON" });
+        return json(res, 400, { error: { type: "invalid_request_error", message: "Invalid JSON body" } }, req);
+      }
+
+      const modelId = parsedBody.model;
+      const route = modelIndex()[modelId];
+      if (!route) {
+        ctx.end(404, { model: modelId, msg: "not found" });
+        return json(res, 404, { error: { type: "not_found", message: `Model "${modelId}" not found. Available: ${availableModelsStr()}` } }, req);
+      }
+
+      const { backend, modelId: backendModelId } = route;
+      parsedBody.model = backendModelId;
+      ctx.on("route", { backend: backend.provider, model: modelId });
+
+      if (!requireApiKey(req, res, ctx, backend)) return;
+
+      if (!tryAcquireCircuit(backend)) {
+        ctx.end(503, { backend: backend.provider, msg: "circuit open" });
+        return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } }, req);
+      }
+
+      if (backend.type === "openai") {
+        return proxyResponsesAsOpenAI(req, res, ctx, backend, parsedBody);
+      }
+      return proxyResponsesAsAnthropic(req, res, ctx, backend, parsedBody);
     }
 
     if (requestPath.startsWith("/anthropic/v1/messages")) {
@@ -375,12 +415,12 @@ const server = http.createServer((req, res) => {
 
       ctx.on("route", { backend: backend.provider, model: modelId });
 
+      if (!requireApiKey(req, res, ctx, backend)) return;
+
       if (!tryAcquireCircuit(backend)) {
         ctx.end(503, { backend: backend.provider, msg: "circuit open" });
         return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } }, req);
       }
-
-      if (!requireApiKey(req, res, ctx, backend)) return;
 
       if (backend.type === "openai") {
         return proxyOpenAIChat(req, res, ctx, backend, parsedBody);
@@ -400,8 +440,13 @@ server.headersTimeout = LOCAL_HEADERS_TIMEOUT;
 server.requestTimeout = TIMEOUT;
 
 server.listen(PORT, "127.0.0.1", () => {
-  system("info", `listening on http://127.0.0.1:${PORT} (gateway — API only, not a browser URL)`);
-  system("info", `dashboard at http://127.0.0.1:${PORT}/dashboard`);
+  const banner = buildStartupBanner({
+    host: "127.0.0.1",
+    port: PORT,
+    backendCount: backends().length,
+    modelCount: modelList().length,
+  });
+  for (const line of banner) system("info", line);
 });
 
 server.on("error", err => {

@@ -70,18 +70,18 @@ In short: **your client code never changes. Switch models by changing one string
 
 - **Protocol agnostic**: OpenAI SDK / Anthropic SDK / Claude Code Desktop / curl / LangChain / LiteLLM / Cursor / Continue.dev all work
 - **Model agnostic**: Claude, GPT, DeepSeek, Qwen, Moonshot, GLM, Ollama, etc., unified entrypoint
-- **Path agnostic**: Same gateway listens on both `/v1/messages` and `/v1/chat/completions`
+- **Path agnostic**: Same gateway listens on `/v1/messages`, `/v1/chat/completions`, and `/v1/responses` (OpenAI Responses API)
 - **Minimal dependencies**: `undici` for HTTP + `better-sqlite3` for persistent token storage — single `npm install`
 - **Modular codebase**: Cleanly split into `src/` modules (config, logger, metrics, converters, handlers, etc.)
 - **Full conversion**: Streaming SSE, tool calls, images, system prompts, usage — all preserved across protocols
 - **Local HTTPS**: mkcert + Caddy, system-trusted certificates
 - **Process supervision**: Built-in health checks, auto-restart, graceful shutdown (30s drain)
 - **Observability**: Structured logs (TTY-color / JSON-piped) + Metrics endpoint (P50/P95/P99, token stats)
-- **Usage Dashboard**: Built-in web UI at `/_dashboard` — per-model token totals, cache hits, TTFT, ITL, QPS, token/s, with Chart.js visualization and time-range filtering
+- **Usage Dashboard**: Built-in web UI at `/_dashboard` — per-model token totals, cache hits, TTFT, ITL, QPS, token/s, with inline SVG charts (no external JS) and time-range filtering
 - **Persistent storage**: SQLite (WAL mode, batched writes) with 365-day retention — survives restarts
 - **Accurate token capture**: Captures usage from all 8 client-backend path combinations (streaming and non-streaming, passthrough and converted) via the API response data
 - **Thinking adaptation**: Auto-normalize `thinking.enabled` to AWS Bedrock-compatible `adaptive`
-- **Tested**: 115 unit tests covering converters, thinking, metrics, token estimation, usage recording, SSE parsing, and circuit breaker
+- **Tested**: 194 unit tests covering converters (Chat ↔ Anthropic, Responses ↔ Chat), thinking, metrics, token estimation, usage recording, SSE parsing, circuit breaker, startup banner, and persistent-store schema resilience
 
 ## Quick Start
 
@@ -244,6 +244,8 @@ This is the project's **core capability**. The four combinations:
 |:---------:|:---------:|:--------:|:--------|
 | **OpenAI** `/v1/chat/completions` | `anthropic` | **Convert** | OpenAI SDK → Claude |
 | **OpenAI** `/v1/chat/completions` | `openai` | Passthrough | OpenAI SDK → GPT / DeepSeek |
+| **OpenAI** `/v1/responses` | `openai` | **Convert** (Responses → Chat) | Codex / OpenAI SDK (Responses) → GPT / DeepSeek |
+| **OpenAI** `/v1/responses` | `anthropic` | **Convert** (Responses → Chat → Anthropic) | Codex / OpenAI SDK (Responses) → Claude |
 | **Anthropic** `/v1/messages` | `anthropic` | Passthrough | Claude Code Desktop → Claude |
 | **Anthropic** `/v1/messages` | `openai` | **Convert** | Claude Code Desktop → GPT |
 
@@ -341,6 +343,33 @@ const resp = await client.chat.completions.create({
 });
 ```
 
+### OpenAI Responses SDK (Codex-compatible)
+
+Same base URL as Chat Completions — the SDK appends `/responses`:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://127.0.0.1:8443/anthropic/v1",
+    api_key="any-string",
+)
+
+# Call GPT through the Responses API (native)
+resp = client.responses.create(model="gpt-4o", input="Hello")
+print(resp.output_text)
+
+# Call Claude through the Responses API (Responses → Chat → Anthropic conversion)
+resp = client.responses.create(model="Claude-Opus-4.7", input="Hello")
+print(resp.output_text)
+
+# Streaming
+with client.responses.stream(model="gpt-4o", input="Write a poem") as stream:
+    for event in stream:
+        if event.type == "response.output_text.delta":
+            print(event.delta, end="")
+```
+
 ### Anthropic Python SDK
 
 ```python
@@ -402,7 +431,37 @@ curl -k https://127.0.0.1:8443/anthropic/v1/messages \
   -H 'Content-Type: application/json' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{"model":"gpt-4o","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}'
+
+# 5. OpenAI Responses protocol → OpenAI backend (convert Responses ↔ Chat)
+curl -k https://127.0.0.1:8443/anthropic/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o","input":"hi"}'
+
+# 6. OpenAI Responses protocol → Anthropic backend (convert Responses → Chat → Anthropic)
+curl -k https://127.0.0.1:8443/anthropic/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Claude-Opus-4.7","input":"hi"}'
 ```
+
+### OpenAI Responses API notes
+
+The `/v1/responses` endpoint accepts the newer OpenAI Responses request shape and
+emits Responses-style SSE (`response.created`, `response.output_text.delta`,
+`response.completed`, etc.). Supported surface:
+
+| Feature | Supported |
+|---|---|
+| String `input` and array input items (`message`, `function_call`, `function_call_output`) | ✅ |
+| `input_text` / `input_image` content parts | ✅ |
+| `instructions` (mapped to a leading system message) | ✅ |
+| `tools` (function tools, flat shape) + `tool_choice` + `parallel_tool_calls` | ✅ |
+| Streaming SSE with canonical event sequence & `sequence_number` | ✅ |
+| `max_output_tokens` (renamed internally to `max_tokens`) | ✅ |
+| `reasoning.effort` (passed through to models that support it) | ✅ |
+| `usage.input_tokens_details.cached_tokens` | ✅ |
+| Hosted tools (`web_search_preview`, `file_search`, `code_interpreter`) | ❌ dropped silently — gateway is stateless |
+| `store`, `previous_response_id` | ❌ ignored — gateway does not persist Response state (response always has `store:false`, `previous_response_id:null`) |
+| `metadata` | ⚠️ echoed back in the response but not persisted |
 
 ### Other OpenAI-compatible tools
 
@@ -700,6 +759,7 @@ All paths are prefixed with `/anthropic` (to coexist with other services behind 
 | Method | Path | Description |
 |------|------|------|
 | `POST` | `/anthropic/v1/chat/completions` | Chat Completions API |
+| `POST` | `/anthropic/v1/responses` | Responses API (streaming, tool calls, images, structured output) |
 
 ### Model discovery
 
@@ -900,8 +960,8 @@ openproxyrouter/
 │   ├── http_utils.js      # JSON response helper
 │   ├── usage_recorder.js  # Central token usage normalization + recording seam
 │   ├── store.js           # SQLite persistence: WAL, batched writes, 365d retention, analytics queries
-│   ├── dashboard_html.js  # Web dashboard UI (Chart.js, time-range filtering, per-model metrics)
-│   └── *.test.js          # 115 unit tests
+│   ├── dashboard_html.js  # Web dashboard UI (inline SVG charts, time-range filtering, per-model metrics)
+│   └── *.test.js          # 194 unit tests
 ├── start.sh               # Launch & supervise script (Heimdall)
 ├── package.json           # Declares undici as sole runtime dependency
 ├── backends.json          # Backend config, gitignored (create manually)
