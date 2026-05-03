@@ -9,6 +9,16 @@ const LOCAL_KEEP_ALIVE_TIMEOUT = 65_000;
 const LOCAL_HEADERS_TIMEOUT = 66_000;
 const BACKENDS_PATH = path.join(__dirname, "..", "backends.json");
 
+const EXTRA_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
+const ALLOWED_ORIGINS = new Set([
+  `http://127.0.0.1:${PORT}`,
+  `http://localhost:${PORT}`,
+  ...EXTRA_ALLOWED_ORIGINS,
+]);
+const ALLOWED_METHODS = "GET,POST,HEAD,OPTIONS";
+const ALLOWED_HEADERS = "authorization,content-type,x-api-key,anthropic-version,anthropic-beta";
+
 const HOP_BY_HOP = new Set([
   "transfer-encoding", "connection", "keep-alive",
   "proxy-authenticate", "proxy-authorization",
@@ -53,4 +63,7 @@ module.exports = {
   SHUTDOWN_DRAIN_MS,
   DISPATCHER_OPTIONS,
   RETRYABLE_CODES,
+  ALLOWED_ORIGINS,
+  ALLOWED_METHODS,
+  ALLOWED_HEADERS,
 };

@@ -23,13 +23,42 @@ function upstreamErrStatus(err) {
   return 502;
 }
 
+function circuitState(backend) {
+  if (!backend.circuitOpenUntil) return "closed";
+  if (Date.now() < backend.circuitOpenUntil) return "open";
+  return "half_open";
+}
+
 function isCircuitOpen(backend) {
-  return !!(backend.circuitOpenUntil && Date.now() < backend.circuitOpenUntil);
+  // Pure predicate — "open" only. half_open is treated as available for passive checks.
+  return circuitState(backend) === "open";
+}
+
+function tryAcquireCircuit(backend) {
+  // Side-effectful gate for the request path: returns false when the request
+  // should be rejected with 503. In half_open state, allows exactly one probe
+  // at a time; others are blocked until the probe settles.
+  const state = circuitState(backend);
+  if (state === "closed") return true;
+  if (state === "open") return false;
+  if (backend.halfOpenInflight) return false;
+  backend.halfOpenInflight = true;
+  system("info", `circuit half-open for backend ${backend.provider} — allowing probe`,
+    { backend: backend.provider });
+  return true;
 }
 
 function onBackendError(backend) {
+  const wasProbe = !!backend.halfOpenInflight;
+  backend.halfOpenInflight = false;
   backend.consecutiveErrors = (backend.consecutiveErrors || 0) + 1;
-  if (backend.consecutiveErrors >= CIRCUIT_THRESHOLD && !isCircuitOpen(backend)) {
+  if (wasProbe) {
+    backend.circuitOpenUntil = Date.now() + CIRCUIT_OPEN_MS;
+    system("warn", `circuit re-opened for backend ${backend.provider} — probe failed`,
+      { backend: backend.provider });
+    return;
+  }
+  if (backend.consecutiveErrors >= CIRCUIT_THRESHOLD && circuitState(backend) !== "open") {
     backend.circuitOpenUntil = Date.now() + CIRCUIT_OPEN_MS;
     system("warn", `circuit opened for backend ${backend.provider} after ${backend.consecutiveErrors} consecutive errors`,
       { backend: backend.provider });
@@ -37,9 +66,15 @@ function onBackendError(backend) {
 }
 
 function onBackendSuccess(backend) {
+  const wasProbe = !!backend.halfOpenInflight;
+  backend.halfOpenInflight = false;
   if (backend.consecutiveErrors || backend.circuitOpenUntil) {
     backend.consecutiveErrors = 0;
     backend.circuitOpenUntil = 0;
+    if (wasProbe) {
+      system("info", `circuit closed for backend ${backend.provider} — probe succeeded`,
+        { backend: backend.provider });
+    }
   }
 }
 
@@ -239,6 +274,10 @@ function resolveApiKey(req, backendApiKey) {
   return "";
 }
 
+function hasApiKey(req, backendApiKey) {
+  return !!resolveApiKey(req, backendApiKey);
+}
+
 function abortAllInFlight(reason) {
   for (const ac of inFlightAbortControllers) {
     try { ac.abort(reason); } catch {}
@@ -261,9 +300,12 @@ module.exports = {
   doUpstream,
   upstreamErrStatus,
   isCircuitOpen,
+  tryAcquireCircuit,
+  circuitState,
   onBackendError,
   onBackendSuccess,
   resolveApiKey,
+  hasApiKey,
   abortAllInFlight,
   getInFlightAbortControllers,
   resetForTest() {

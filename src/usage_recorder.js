@@ -53,6 +53,10 @@ function normalizeUsage(usage) {
   if (typeof usage.output_tokens === "number") output = usage.output_tokens;
   if (typeof usage.cache_read_input_tokens === "number") cacheRead = usage.cache_read_input_tokens;
   if (typeof usage.cache_creation_input_tokens === "number") cacheWrite = usage.cache_creation_input_tokens;
+  // Normalized shape — allow normalizeUsage to be safely invoked on its own
+  // output (e.g., acc objects built by stream handlers).
+  if (typeof usage.cache_read_tokens === "number") cacheRead = usage.cache_read_tokens;
+  if (typeof usage.cache_write_tokens === "number") cacheWrite = usage.cache_write_tokens;
 
   if (typeof usage.prompt_tokens === "number") {
     let cached = 0;

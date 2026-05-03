@@ -897,7 +897,6 @@ openproxyrouter/
 │   ├── metrics.js         # 内存指标 + P50/P95/P99 延迟
 │   ├── backend.js         # 后端注册表、上游调用、熔断器
 │   ├── thinking.js        # Thinking 配置归一化
-│   ├── token_estimate.js  # Token 估算（供 count_tokens 使用）
 │   ├── converters.js      # 4 × 协议转换器 + SSE 流翻译器 + parseAnthropicSSEUsage
 │   ├── handlers.js        # 全部 4 个代理处理器 + 8 个 Token 捕获点
 │   ├── http_utils.js      # JSON 响应工具函数

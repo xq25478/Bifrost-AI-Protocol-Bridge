@@ -1,5 +1,7 @@
 "use strict";
 
+const { incMetric, recordLatency } = require("./metrics");
+
 const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
 const LOG_LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 const LOG_THRESHOLD = LOG_LEVELS[LOG_LEVEL] ?? 20;
@@ -123,10 +125,18 @@ function system(level, msg, extra = {}) {
  *   - upstream_start_ms / upstream_end_ms : upstream call timing (for breakdown)
  *   - bodySample : optional redacted slice of the request body, surfaced on error logs
  */
+function recordHttpOutcome(status, elapsed) {
+  if (typeof elapsed === "number" && elapsed >= 0) recordLatency(elapsed);
+  if (typeof status !== "number") return;
+  if (status >= 200 && status < 300) incMetric("status_2xx");
+  else if (status >= 400 && status < 500) incMetric("status_4xx");
+  else if (status >= 500 && status < 600) incMetric("status_5xx");
+}
+
 function requestlog(rid, method, path) {
   if (!rid) {
     const noop = {
-      on() {}, end() {}, err() {}, mute() {}, attachUsage() {}, attachBody() {}, markUpstream() {}, flushOnClose() {},
+      on() {}, end() {}, err() {}, mute() {}, attachUsage() {}, attachBody() {}, markUpstream() {}, markTTFT() {}, flushOnClose() {},
       _start: 0, _usage: null, _extra: null,
     };
     return noop;
@@ -137,8 +147,10 @@ function requestlog(rid, method, path) {
   let _usage = null;
   let _usageExtra = null;
   let _bodySample = null;
+  let _inputChars = 0;
   let _upstreamStartMs = 0;
   let _upstreamMs = 0;
+  let _ttftMs = 0;
   let _flushed = false;
 
   const { recordRequestUsage } = require("./usage_recorder");
@@ -147,11 +159,20 @@ function requestlog(rid, method, path) {
     if (_flushed) return;
     if (!_usage) return;
     _flushed = true;
+    const duration = (_usageExtra && typeof _usageExtra.duration_ms === "number")
+      ? _usageExtra.duration_ms : (Date.now() - start);
+    const output = Number(_usage.output_tokens || _usage.completion_tokens || 0);
+    const itl = (_ttftMs > 0 && output > 0 && duration > _ttftMs)
+      ? Math.round((duration - _ttftMs) / output)
+      : 0;
     recordRequestUsage({
       rid,
       ts: start,
       usage: _usage,
       ..._usageExtra,
+      ttft_ms: _ttftMs | 0,
+      itl_avg_ms: itl | 0,
+      input_chars: _inputChars | 0,
       partial: !!partial,
     });
     _usage = null;
@@ -174,6 +195,8 @@ function requestlog(rid, method, path) {
     },
     attachBody(buf) {
       _bodySample = redactBodySample(buf);
+      if (Buffer.isBuffer(buf)) _inputChars = buf.length;
+      else if (typeof buf === "string") _inputChars = Buffer.byteLength(buf, "utf8");
     },
     markUpstream(phase) {
       if (phase === "start") _upstreamStartMs = Date.now();
@@ -181,23 +204,29 @@ function requestlog(rid, method, path) {
         _upstreamMs = Date.now() - _upstreamStartMs;
       }
     },
+    markTTFT() {
+      if (_ttftMs === 0) _ttftMs = Date.now() - start;
+    },
     end(status, extra = {}) {
       if (muted) return;
       flushUsage();
       const elapsed = Date.now() - start;
       const out = { status, elapsed, ...extra };
       if (_upstreamMs) out.upstream_ms = _upstreamMs;
+      recordHttpOutcome(status, elapsed);
       self.on("done", out);
     },
     err(status, err, extra = {}) {
       if (muted) return;
       flushUsage();
+      const elapsed = Date.now() - start;
       const out = {
         ...base, event: "error", level: "error", status,
-        elapsed: Date.now() - start, err: err.message, ...extra
+        elapsed, err: err.message, ...extra
       };
       if (_upstreamMs) out.upstream_ms = _upstreamMs;
       if (_bodySample) out.body_sample = _bodySample;
+      recordHttpOutcome(status, elapsed);
       writelog(out);
     },
     /**

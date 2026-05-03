@@ -895,7 +895,6 @@ openproxyrouter/
 │   ├── metrics.js         # In-memory metrics + P50/P95/P99 latency
 │   ├── backend.js         # Backend registry, upstream calls, circuit breaker
 │   ├── thinking.js        # Thinking configuration normalization
-│   ├── token_estimate.js  # Token estimation for count_tokens endpoint
 │   ├── converters.js      # All 4 protocol converters + SSE translators + parseAnthropicSSEUsage
 │   ├── handlers.js        # All 4 proxy handlers with 8 capture points for token usage
 │   ├── http_utils.js      # JSON response helper

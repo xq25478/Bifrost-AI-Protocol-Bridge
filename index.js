@@ -6,8 +6,8 @@ const { system, requestlog } = require("./src/logger");
 const { incMetric, metricsSnapshot } = require("./src/metrics");
 const {
   backends, modelIndex, modelList, availableModelsStr,
-  loadBackends, watchBackends, isCircuitOpen, abortAllInFlight,
-  doUpstream, upstreamErrStatus, resolveApiKey,
+  loadBackends, watchBackends, isCircuitOpen, tryAcquireCircuit, abortAllInFlight,
+  doUpstream, upstreamErrStatus, resolveApiKey, hasApiKey,
   onBackendError, onBackendSuccess,
 } = require("./src/backend");
 const { normalizeThinking } = require("./src/thinking");
@@ -19,13 +19,12 @@ const {
 const {
   PORT, MAX_BODY_SIZE, LOCAL_KEEP_ALIVE_TIMEOUT,
   LOCAL_HEADERS_TIMEOUT, TIMEOUT, SHUTDOWN_DRAIN_MS,
+  ALLOWED_ORIGINS, ALLOWED_METHODS, ALLOWED_HEADERS,
 } = require("./src/config");
 
 let store = null;
 try { store = require("./src/store"); } catch {}
 
-// Pre-render dashboard HTML once at startup. The output is a static string
-// so we avoid re-running the builder on every request.
 const { dashboardHtml: _dashboardHtmlBuilder } = require("./src/dashboard_html");
 const DASHBOARD_HTML = _dashboardHtmlBuilder();
 const DASHBOARD_HTML_BYTES = Buffer.byteLength(DASHBOARD_HTML, "utf8");
@@ -40,8 +39,6 @@ if (store && typeof store.open === "function") {
   setInterval(() => { if (store && store.prune) store.prune(); }, 3600_000);
 }
 
-// Maximum dashboard query window (90 days). Queries outside this range are
-// clamped to "to - MAX_QUERY_RANGE_MS .. to" to bound SQLite scan cost.
 const MAX_QUERY_RANGE_MS = 90 * 24 * 3600 * 1000;
 
 function parseDashboardRange(searchParams) {
@@ -72,48 +69,14 @@ function buildDashboardBody(searchParams) {
   return body;
 }
 
-// ---- Dashboard server (separate port, no risk of gateway route conflict) ----
-const DASHBOARD_PORT = PORT + 1;
-
-const dashboardServer = http.createServer((req, res) => {
-  const requestUrl = new URL(req.url, "http://127.0.0.1");
-  const dp = requestUrl.pathname;
-
-  if (req.method === "GET" && dp === "/") {
-    res.writeHead(200, {
-      "content-type": "text/html; charset=utf-8",
-      "content-length": DASHBOARD_HTML_BYTES,
-      "access-control-allow-origin": "*",
-    });
-    res.end(DASHBOARD_HTML);
-    return;
-  }
-
-
-  if (req.method === "GET" && dp === "/api") {
-    const body = buildDashboardBody(requestUrl.searchParams);
-    res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*" });
-    res.end(JSON.stringify(body));
-    return;
-  }
-
-  if (req.method === "OPTIONS") {
-    res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-headers": "*", "access-control-allow-methods": "GET,HEAD,OPTIONS" });
-    res.end();
-    return;
-  }
-
-  res.writeHead(404);
-  res.end("not found");
-});
-
-dashboardServer.listen(DASHBOARD_PORT, "127.0.0.1", () => {
-  system("info", "dashboard at http://127.0.0.1:" + DASHBOARD_PORT + " — open in your browser");
-});
-
-// ================================================================
-// Gateway server
-// ================================================================
+function requireApiKey(req, res, ctx, backend) {
+  if (hasApiKey(req, backend.apiKey)) return true;
+  ctx.end(401, { backend: backend.provider, msg: "no api key" });
+  json(res, 401, {
+    error: { type: "authentication_error", message: "API key required: configure backend.apiKey or send Authorization: Bearer <key>" }
+  }, req);
+  return false;
+}
 
 const server = http.createServer((req, res) => {
   const requestId = crypto.randomUUID().slice(0, 8);
@@ -125,11 +88,15 @@ const server = http.createServer((req, res) => {
   if (!isHealth) incMetric("requests_total");
 
   if (req.method === "OPTIONS") {
-    res.writeHead(204, {
-      "access-control-allow-origin": "*",
-      "access-control-allow-headers": "*",
-      "access-control-allow-methods": "GET,POST,HEAD,OPTIONS"
-    });
+    const origin = req.headers.origin;
+    const allowed = origin && ALLOWED_ORIGINS.has(origin);
+    const h = { "access-control-allow-methods": ALLOWED_METHODS };
+    if (allowed) {
+      h["access-control-allow-origin"] = origin;
+      h["access-control-allow-headers"] = ALLOWED_HEADERS;
+      h["vary"] = "Origin";
+    }
+    res.writeHead(204, h);
     res.end();
     ctx.mute();
     return;
@@ -142,15 +109,12 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // /healthz — process is alive (cheap, no dependencies checked)
   if ((req.method === "GET" || req.method === "HEAD") && requestPath === "/healthz") {
     ctx.mute();
     if (req.method === "HEAD") { res.writeHead(200); return res.end(); }
-    return json(res, 200, { status: "ok", uptime_s: Math.floor(process.uptime()) });
+    return json(res, 200, { status: "ok", uptime_s: Math.floor(process.uptime()) }, req);
   }
 
-  // /readyz — checks dependencies: at least one backend not in open circuit,
-  // and (if compiled) sqlite store is open.
   if ((req.method === "GET" || req.method === "HEAD") && requestPath === "/readyz") {
     ctx.mute();
     const allBackends = backends();
@@ -164,12 +128,11 @@ const server = http.createServer((req, res) => {
       backends: { total: allBackends.length, healthy: healthyBackends.length },
       models: modelList().length,
       store: store ? "ok" : "unavailable",
-    });
+    }, req);
   }
 
   if (req.method === "GET" && (requestPath === "/" || requestPath === "/anthropic")) {
     ctx.end(200);
-    // Browser visiting the gateway port — show a hint
     const accept = req.headers.accept || "";
     if (accept.includes("text/html")) {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
@@ -179,20 +142,19 @@ const server = http.createServer((req, res) => {
 <a href="/dashboard" style="display:inline-block;margin-top:12px;padding:8px 20px;background:#238636;color:#fff;border-radius:6px;text-decoration:none;font-weight:500">Open Dashboard →</a>
 <p style="margin-top:20px;color:#5c6375;font-size:12px">This is the API proxy port — not a browser URL</p></div></body></html>`);
     }
-    return json(res, 200, { ok: true, backends: backends().length, models: modelList().length });
+    return json(res, 200, { ok: true, backends: backends().length, models: modelList().length }, req);
   }
 
   if (req.method === "GET" && requestPath === "/dashboard/api") {
     const body = buildDashboardBody(requestUrl.searchParams);
     ctx.end(200);
-    return json(res, 200, body);
+    return json(res, 200, body, req);
   }
 
   if (req.method === "GET" && requestPath === "/dashboard") {
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
       "content-length": DASHBOARD_HTML_BYTES,
-      "access-control-allow-origin": "*",
     });
     ctx.end(200);
     return res.end(DASHBOARD_HTML);
@@ -201,7 +163,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === "GET" && requestPath === "/anthropic/v1/metrics") {
     ctx.end(200);
-    return json(res, 200, metricsSnapshot());
+    return json(res, 200, metricsSnapshot(), req);
   }
 
   if (req.method === "GET" && requestPath === "/anthropic/v1/models") {
@@ -211,7 +173,7 @@ const server = http.createServer((req, res) => {
       has_more: false,
       first_id: modelList()[0]?.id || "",
       last_id: modelList()[modelList().length - 1]?.id || ""
-    });
+    }, req);
   }
 
   if (req.method === "GET" && requestPath.startsWith("/anthropic/v1/models/")) {
@@ -219,15 +181,15 @@ const server = http.createServer((req, res) => {
     const found = modelIndex()[modelId];
     if (found) {
       ctx.end(200, { model: modelId });
-      return json(res, 200, { id: modelId, type: "model", display_name: modelId, created_at: "2026-01-01T00:00:00Z" });
+      return json(res, 200, { id: modelId, type: "model", display_name: modelId, created_at: "2026-01-01T00:00:00Z" }, req);
     }
     ctx.end(404, { model: modelId });
-    return json(res, 404, { error: { type: "not_found", message: "Model not found" } });
+    return json(res, 404, { error: { type: "not_found", message: "Model not found" } }, req);
   }
 
   if (req.method !== "POST") {
     ctx.end(405);
-    return json(res, 405, { error: { type: "method_not_allowed", message: "Method not allowed" } });
+    return json(res, 405, { error: { type: "method_not_allowed", message: "Method not allowed" } }, req);
   }
 
   const bodyChunks = [];
@@ -240,7 +202,7 @@ const server = http.createServer((req, res) => {
       bodyExceeded = true;
       req.destroy();
       ctx.err(413, new Error("payload too large"));
-      if (!res.headersSent) json(res, 413, { error: { type: "invalid_request_error", message: "Request body exceeds 32 MB limit" } });
+      if (!res.headersSent) json(res, 413, { error: { type: "invalid_request_error", message: "Request body exceeds 32 MB limit" } }, req);
       else res.destroy();
       return;
     }
@@ -252,13 +214,13 @@ const server = http.createServer((req, res) => {
     if (requestPath === "/anthropic/v1/messages/count_tokens") {
       if (!bodyBuf) {
         ctx.end(400, { msg: "body required" });
-        return json(res, 400, { error: { type: "invalid_request_error", message: "Request body is required" } });
+        return json(res, 400, { error: { type: "invalid_request_error", message: "Request body is required" } }, req);
       }
 
       let parsedBody;
       try { parsedBody = JSON.parse(bodyBuf); } catch {
         ctx.end(400, { msg: "invalid JSON" });
-        return json(res, 400, { error: { type: "invalid_request_error", message: "Invalid JSON body" } });
+        return json(res, 400, { error: { type: "invalid_request_error", message: "Invalid JSON body" } }, req);
       }
 
       normalizeThinking(parsedBody);
@@ -267,7 +229,7 @@ const server = http.createServer((req, res) => {
       const route = modelIndex()[modelId];
       if (!route) {
         ctx.end(404, { model: modelId, msg: "not found" });
-        return json(res, 404, { error: { type: "not_found", message: `Model "${modelId}" not found. Available: ${availableModelsStr()}` } });
+        return json(res, 404, { error: { type: "not_found", message: `Model "${modelId}" not found. Available: ${availableModelsStr()}` } }, req);
       }
 
       const { backend, modelId: backendModelId } = route;
@@ -275,135 +237,75 @@ const server = http.createServer((req, res) => {
 
       if (backend.type !== "anthropic") {
         ctx.end(501, { backend: backend.provider, model: modelId, msg: "count_tokens unsupported" });
-        return json(res, 501, { error: { type: "not_implemented", message: `count_tokens is only supported for Anthropic-type backends; model "${modelId}" is routed to ${backend.provider} (${backend.type})` } });
+        return json(res, 501, { error: { type: "not_implemented", message: `count_tokens is only supported for Anthropic-type backends; model "${modelId}" is routed to ${backend.provider} (${backend.type})` } }, req);
       }
 
-      if (isCircuitOpen(backend)) {
+      if (!tryAcquireCircuit(backend)) {
         ctx.end(503, { backend: backend.provider, msg: "circuit open" });
-        return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } });
+        return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } }, req);
       }
+
+      if (!requireApiKey(req, res, ctx, backend)) return;
 
       ctx.on("route", { backend: backend.provider, model: modelId });
 
       (async () => {
-        if (backend.type === "anthropic") {
-          // Anthropic backend: forward to native count_tokens endpoint
-          const upstreamUrl = new URL(backend.baseUrl.replace(/\/+$/, "") + "/v1/messages/count_tokens");
-          if (upstreamUrl.searchParams.has("beta")) upstreamUrl.searchParams.delete("beta");
+        const upstreamUrl = new URL(backend.baseUrl.replace(/\/+$/, "") + "/v1/messages/count_tokens");
+        if (upstreamUrl.searchParams.has("beta")) upstreamUrl.searchParams.delete("beta");
 
-          const reqBodyBuf = Buffer.from(JSON.stringify(parsedBody));
-          const upstreamHeaders = {
-            "content-type": "application/json",
-            "content-length": reqBodyBuf.length,
-            "anthropic-version": "2023-06-01",
-            "x-api-key": resolveApiKey(req, backend.apiKey),
-            host: upstreamUrl.host,
-          };
+        const reqBodyBuf = Buffer.from(JSON.stringify(parsedBody));
+        const upstreamHeaders = {
+          "content-type": "application/json",
+          "content-length": reqBodyBuf.length,
+          "anthropic-version": "2023-06-01",
+          "x-api-key": resolveApiKey(req, backend.apiKey),
+          host: upstreamUrl.host,
+        };
 
-          let up;
-          try {
-            up = await doUpstream(upstreamUrl, { method: "POST", headers: upstreamHeaders, body: reqBodyBuf }, backend);
-          } catch (err) {
-            incMetric("upstream_errors");
-            onBackendError(backend);
-            const status = upstreamErrStatus(err);
-            ctx.err(status, err, { backend: backend.provider });
-            if (res.headersSent) { res.destroy(); return; }
-            return json(res, status, { error: { type: "upstream_error", message: String(err), code: status } });
-          }
-
-          const { statusCode, body: upstreamBody, finish } = up;
-          const chunks = [];
-          let totalLen = 0;
-          upstreamBody.on("data", chunk => { chunks.push(chunk); totalLen += chunk.length; });
-          upstreamBody.on("end", () => {
-            const buf = Buffer.concat(chunks, totalLen);
-            let parsedResp;
-            try {
-              parsedResp = JSON.parse(buf.toString("utf8"));
-            } catch {
-              onBackendError(backend);
-              ctx.err(502, new Error("invalid upstream response"), { backend: backend.provider });
-              finish();
-              if (res.headersSent) { res.destroy(); return; }
-              return json(res, 502, { error: { type: "upstream_error", message: "Invalid count_tokens response from upstream" } });
-            }
-            const inputTokens = typeof parsedResp.input_tokens === "number" ? parsedResp.input_tokens : 0;
-            ctx.on("count_tokens", { backend: backend.provider, model: modelId, msg: `input_tokens=${inputTokens}` });
-            onBackendSuccess(backend);
-            ctx.end(statusCode || 200, { backend: backend.provider });
-            finish();
-            return json(res, statusCode || 200, parsedResp);
-          });
-          upstreamBody.on("error", err => {
-            finish();
-            onBackendError(backend);
-            incMetric("upstream_errors");
-            const status = upstreamErrStatus(err);
-            ctx.err(status, err, { backend: backend.provider });
-            if (res.headersSent) { res.destroy(); return; }
-            return json(res, status, { error: { type: "upstream_error", message: String(err), code: status } });
-          });
-        } else {
-          // OpenAI-compatible backend: send a minimal chat completion to get usage.prompt_tokens
-          const openaiBody = anthropicBodyToOpenAIChat(parsedBody);
-          openaiBody.stream = false;
-          openaiBody.max_tokens = 1;
-          const reqBodyBuf = Buffer.from(JSON.stringify(openaiBody));
-          const upstreamUrl = new URL("/v1/chat/completions", backend.baseUrl.replace(/\/v1\/?$/, ""));
-          const upstreamHeaders = {
-            "content-type": "application/json",
-            "content-length": reqBodyBuf.length,
-            "authorization": `Bearer ${resolveApiKey(req, backend.apiKey)}`,
-            host: upstreamUrl.host,
-          };
-
-          let up;
-          try {
-            up = await doUpstream(upstreamUrl, { method: "POST", headers: upstreamHeaders, body: reqBodyBuf }, backend);
-          } catch (err) {
-            incMetric("upstream_errors");
-            onBackendError(backend);
-            const status = upstreamErrStatus(err);
-            ctx.err(status, err, { backend: backend.provider });
-            if (res.headersSent) { res.destroy(); return; }
-            return json(res, status, { error: { type: "upstream_error", message: String(err), code: status } });
-          }
-
-          const { statusCode, body: upstreamBody, finish } = up;
-          const chunks = [];
-          let totalLen = 0;
-          upstreamBody.on("data", chunk => { chunks.push(chunk); totalLen += chunk.length; });
-          upstreamBody.on("end", () => {
-            const buf = Buffer.concat(chunks, totalLen);
-            let parsedResp;
-            try {
-              parsedResp = JSON.parse(buf.toString("utf8"));
-            } catch {
-              onBackendError(backend);
-              ctx.err(502, new Error("invalid upstream response"), { backend: backend.provider });
-              finish();
-              if (res.headersSent) { res.destroy(); return; }
-              return json(res, 502, { error: { type: "upstream_error", message: "Invalid count_tokens response from upstream" } });
-            }
-            const inputTokens = (parsedResp.usage && typeof parsedResp.usage.prompt_tokens === "number")
-              ? parsedResp.usage.prompt_tokens : 0;
-            ctx.on("count_tokens", { backend: backend.provider, model: modelId, msg: `input_tokens=${inputTokens}` });
-            onBackendSuccess(backend);
-            ctx.end(statusCode || 200, { backend: backend.provider });
-            finish();
-            return json(res, 200, { input_tokens: inputTokens });
-          });
-          upstreamBody.on("error", err => {
-            finish();
-            onBackendError(backend);
-            incMetric("upstream_errors");
-            const status = upstreamErrStatus(err);
-            ctx.err(status, err, { backend: backend.provider });
-            if (res.headersSent) { res.destroy(); return; }
-            return json(res, status, { error: { type: "upstream_error", message: String(err), code: status } });
-          });
+        let up;
+        try {
+          up = await doUpstream(upstreamUrl, { method: "POST", headers: upstreamHeaders, body: reqBodyBuf }, backend);
+        } catch (err) {
+          incMetric("upstream_errors");
+          onBackendError(backend);
+          const status = upstreamErrStatus(err);
+          ctx.err(status, err, { backend: backend.provider });
+          if (res.headersSent) { res.destroy(); return; }
+          return json(res, status, { error: { type: "upstream_error", message: String(err), code: status } }, req);
         }
+
+        const { statusCode, body: upstreamBody, finish } = up;
+        const chunks = [];
+        let totalLen = 0;
+        upstreamBody.on("data", chunk => { chunks.push(chunk); totalLen += chunk.length; });
+        upstreamBody.on("end", () => {
+          const buf = Buffer.concat(chunks, totalLen);
+          let parsedResp;
+          try {
+            parsedResp = JSON.parse(buf.toString("utf8"));
+          } catch {
+            onBackendError(backend);
+            ctx.err(502, new Error("invalid upstream response"), { backend: backend.provider });
+            finish();
+            if (res.headersSent) { res.destroy(); return; }
+            return json(res, 502, { error: { type: "upstream_error", message: "Invalid count_tokens response from upstream" } }, req);
+          }
+          const inputTokens = typeof parsedResp.input_tokens === "number" ? parsedResp.input_tokens : 0;
+          ctx.on("count_tokens", { backend: backend.provider, model: modelId, msg: `input_tokens=${inputTokens}` });
+          onBackendSuccess(backend);
+          ctx.end(statusCode || 200, { backend: backend.provider });
+          finish();
+          return json(res, statusCode || 200, parsedResp, req);
+        });
+        upstreamBody.on("error", err => {
+          finish();
+          onBackendError(backend);
+          incMetric("upstream_errors");
+          const status = upstreamErrStatus(err);
+          ctx.err(status, err, { backend: backend.provider });
+          if (res.headersSent) { res.destroy(); return; }
+          return json(res, status, { error: { type: "upstream_error", message: String(err), code: status } }, req);
+        });
       })();
       return;
     }
@@ -411,30 +313,32 @@ const server = http.createServer((req, res) => {
     if (requestPath === "/anthropic/v1/chat/completions") {
       if (!bodyBuf) {
         ctx.end(400, { msg: "body required" });
-        return json(res, 400, { error: { type: "invalid_request_error", message: "Request body is required" } });
+        return json(res, 400, { error: { type: "invalid_request_error", message: "Request body is required" } }, req);
       }
 
       let parsedBody;
       try { parsedBody = JSON.parse(bodyBuf); } catch {
         ctx.end(400, { msg: "invalid JSON" });
-        return json(res, 400, { error: { type: "invalid_request_error", message: "Invalid JSON body" } });
+        return json(res, 400, { error: { type: "invalid_request_error", message: "Invalid JSON body" } }, req);
       }
 
       const modelId = parsedBody.model;
       const route = modelIndex()[modelId];
       if (!route) {
         ctx.end(404, { model: modelId, msg: "not found" });
-        return json(res, 404, { error: { type: "not_found", message: `Model "${modelId}" not found. Available: ${availableModelsStr()}` } });
+        return json(res, 404, { error: { type: "not_found", message: `Model "${modelId}" not found. Available: ${availableModelsStr()}` } }, req);
       }
 
       const { backend, modelId: backendModelId } = route;
       parsedBody.model = backendModelId;
       ctx.on("route", { backend: backend.provider, model: modelId });
 
-      if (isCircuitOpen(backend)) {
+      if (!tryAcquireCircuit(backend)) {
         ctx.end(503, { backend: backend.provider, msg: "circuit open" });
-        return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } });
+        return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } }, req);
       }
+
+      if (!requireApiKey(req, res, ctx, backend)) return;
 
       if (backend.type === "openai") {
         const bodyStr = JSON.stringify(parsedBody);
@@ -447,13 +351,13 @@ const server = http.createServer((req, res) => {
     if (requestPath.startsWith("/anthropic/v1/messages")) {
       if (!bodyBuf) {
         ctx.end(400, { msg: "body required" });
-        return json(res, 400, { error: { type: "invalid_request_error", message: "Request body is required" } });
+        return json(res, 400, { error: { type: "invalid_request_error", message: "Request body is required" } }, req);
       }
 
       let parsedBody;
       try { parsedBody = JSON.parse(bodyBuf); } catch {
         ctx.end(400, { msg: "invalid JSON" });
-        return json(res, 400, { error: { type: "invalid_request_error", message: "Invalid JSON body" } });
+        return json(res, 400, { error: { type: "invalid_request_error", message: "Invalid JSON body" } }, req);
       }
 
       const modelId = parsedBody.model;
@@ -461,7 +365,7 @@ const server = http.createServer((req, res) => {
 
       if (!route) {
         ctx.end(404, { model: modelId, msg: "not found" });
-        return json(res, 404, { error: { type: "not_found", message: `Model "${modelId}" not found. Available: ${availableModelsStr()}` } });
+        return json(res, 404, { error: { type: "not_found", message: `Model "${modelId}" not found. Available: ${availableModelsStr()}` } }, req);
       }
 
       const { backend, modelId: backendModelId } = route;
@@ -471,10 +375,12 @@ const server = http.createServer((req, res) => {
 
       ctx.on("route", { backend: backend.provider, model: modelId });
 
-      if (isCircuitOpen(backend)) {
+      if (!tryAcquireCircuit(backend)) {
         ctx.end(503, { backend: backend.provider, msg: "circuit open" });
-        return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } });
+        return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } }, req);
       }
+
+      if (!requireApiKey(req, res, ctx, backend)) return;
 
       if (backend.type === "openai") {
         return proxyOpenAIChat(req, res, ctx, backend, parsedBody);
@@ -485,7 +391,7 @@ const server = http.createServer((req, res) => {
     }
 
     ctx.end(404);
-    json(res, 404, { error: { type: "not_found", message: "Not found" } });
+    json(res, 404, { error: { type: "not_found", message: "Not found" } }, req);
   });
 });
 
@@ -509,7 +415,6 @@ function shutdown(signal) {
   if (closing) return;
   closing = true;
   system("warn", `${signal} received, draining requests for ${SHUTDOWN_DRAIN_MS / 1000}s...`);
-  dashboardServer.close(() => {});
   server.close(() => {
     if (store && store.close) store.close();
     system("info", "server closed cleanly");

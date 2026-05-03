@@ -16,8 +16,29 @@ const {
 const { incMetric } = require("./metrics");
 const { HOP_BY_HOP } = require("./config");
 const { normalizeThinking } = require("./thinking");
-const { json } = require("./http_utils");
+const { json, corsHeaders } = require("./http_utils");
 const { normalizeUsage } = require("./usage_recorder");
+const { createSSEParser, isSSEDataLine, sseDataPayload } = require("./sse");
+
+/**
+ * Shared upstream-error handler. Used after `await doUpstream(...)` throws
+ * (no `finish`/no onBackendError — doUpstream already called them), and from
+ * `upstreamBody.on("error", ...)` where both are needed.
+ */
+function sendUpstreamError({ err, ctx, backend, res, req, finish, format }) {
+  if (finish) {
+    finish();
+    onBackendError(backend);
+  }
+  incMetric("upstream_errors");
+  const status = upstreamErrStatus(err);
+  ctx.err(status, err, { backend: backend.provider });
+  if (res.headersSent) { res.destroy(); return; }
+  const body = format === "anthropic"
+    ? { error: { message: String(err), type: "upstream_error", code: status } }
+    : { error: String(err) };
+  json(res, status, body, req);
+}
 
 function injectStreamOptions(bodyStr) {
   try {
@@ -62,11 +83,7 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
   try {
     up = await doUpstream(backendUrl, { method: "POST", headers, body: openaiBuf }, backend, ctx);
   } catch (err) {
-    incMetric("upstream_errors");
-    const status = upstreamErrStatus(err);
-    ctx.err(status, err, { backend: backend.provider });
-    if (res.headersSent) { res.destroy(); return; }
-    return json(res, status, { error: String(err) });
+    return sendUpstreamError({ err, ctx, backend, res, req });
   }
 
   const { statusCode, body: upstreamBody, finish } = up;
@@ -75,7 +92,7 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
-      "access-control-allow-origin": "*"
+      ...corsHeaders(req),
     });
     res.on("close", () => {
       if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
@@ -83,35 +100,29 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
     const msgId = "msg_" + crypto.randomUUID();
     const model = body.model || "";
     const translator = createOpenAIToAnthropicSSETranslator(msgId, model);
-    let buf = null;
+    const parser = createSSEParser();
     let doneSent = false;
 
     upstreamBody.on("data", chunk => {
-      buf = buf ? Buffer.concat([buf, chunk], buf.length + chunk.length) : chunk;
+      if (typeof ctx.markTTFT === "function") ctx.markTTFT();
       const outs = [];
-      let nl;
-      while ((nl = buf.indexOf(0x0A)) !== -1) {
-        const end = nl > 0 && buf[nl - 1] === 0x0D ? nl - 1 : nl;
-        const line = buf.subarray(0, end);
-        buf = buf.subarray(nl + 1);
-        if (line.length < 6 ||
-            line[0] !== 0x64 || line[1] !== 0x61 || line[2] !== 0x74 ||
-            line[3] !== 0x61 || line[4] !== 0x3A || line[5] !== 0x20) continue;
-        const d = line.subarray(6).toString("utf8").trim();
-        if (!d) continue;
+      parser.feed(chunk, line => {
+        if (!isSSEDataLine(line)) return;
+        const d = sseDataPayload(line);
+        if (!d) return;
         if (d === "[DONE]") {
           const tail = translator.finalize();
           if (tail) outs.push(tail);
           outs.push("data: [DONE]\n\n");
           doneSent = true;
-          continue;
+          return;
         }
         try {
           const openaiChunk = JSON.parse(d);
           const out = translator.translate(openaiChunk);
           if (out) outs.push(out);
         } catch {}
-      }
+      });
       if (outs.length > 0) res.write(outs.join(""));
     });
     upstreamBody.on("end", () => {
@@ -134,13 +145,7 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
       finish();
     });
     upstreamBody.on("error", err => {
-      finish();
-      onBackendError(backend);
-      incMetric("upstream_errors");
-      const status = upstreamErrStatus(err);
-      ctx.err(status, err, { backend: backend.provider });
-      if (res.headersSent) { res.destroy(); return; }
-      json(res, status, { error: String(err) });
+      sendUpstreamError({ err, ctx, backend, res, req, finish });
     });
   } else {
     const responseChunks = [];
@@ -155,22 +160,16 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
           stream: 0,
           duration_ms: Date.now() - ctx._start
         });
-        json(res, statusCode || 200, anthropicResp);
+        json(res, statusCode || 200, anthropicResp, req);
       } catch {
-        json(res, 502, { error: "Failed to convert OpenAI response to Anthropic format" });
+        json(res, 502, { error: "Failed to convert OpenAI response to Anthropic format" }, req);
       }
       onBackendSuccess(backend);
       ctx.end(statusCode || 200, { backend: backend.provider });
       finish();
     });
     upstreamBody.on("error", err => {
-      finish();
-      onBackendError(backend);
-      incMetric("upstream_errors");
-      const status = upstreamErrStatus(err);
-      ctx.err(status, err, { backend: backend.provider });
-      if (res.headersSent) { res.destroy(); return; }
-      json(res, status, { error: String(err) });
+      sendUpstreamError({ err, ctx, backend, res, req, finish });
     });
   }
 }
@@ -199,11 +198,7 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
   try {
     up = await doUpstream(upstreamUrl, { method: "POST", headers, body: bodyBuf }, backend, ctx);
   } catch (err) {
-    incMetric("upstream_errors");
-    const status = upstreamErrStatus(err);
-    ctx.err(status, err, { backend: backend.provider });
-    if (res.headersSent) { res.destroy(); return; }
-    return json(res, status, { error: { message: String(err), type: "upstream_error", code: status } });
+    return sendUpstreamError({ err, ctx, backend, res, req, format: "anthropic" });
   }
 
   const { statusCode, body: upstreamBody, finish } = up;
@@ -212,7 +207,7 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
-      "access-control-allow-origin": "*"
+      ...corsHeaders(req),
     });
     res.on("close", () => {
       if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
@@ -220,29 +215,23 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
     const chatId = "chatcmpl-" + crypto.randomUUID().replace(/-/g, "").slice(0, 24);
     const model = anthropicBody.model || "";
 
-    let buffer = null;
+    const parser = createSSEParser();
     const translator = createAnthropicToOpenAISSETranslator(chatId, model);
 
     upstreamBody.on("data", chunk => {
-      buffer = buffer ? Buffer.concat([buffer, chunk], buffer.length + chunk.length) : chunk;
+      if (typeof ctx.markTTFT === "function") ctx.markTTFT();
       const outs = [];
-      let nl;
-      while ((nl = buffer.indexOf(0x0A)) !== -1) {
-        const end = nl > 0 && buffer[nl - 1] === 0x0D ? nl - 1 : nl;
-        const line = buffer.subarray(0, end).toString("utf8");
-        buffer = buffer.subarray(nl + 1);
-        const converted = translator.translate(line);
+      parser.feed(chunk, line => {
+        const converted = translator.translate(line.toString("utf8"));
         if (converted) outs.push(converted);
-      }
+      });
       if (outs.length > 0) res.write(outs.join(""));
     });
     upstreamBody.on("end", () => {
-      if (buffer && buffer.length > 0) {
-        const end = buffer[buffer.length - 1] === 0x0D ? buffer.length - 1 : buffer.length;
-        const line = buffer.subarray(0, end).toString("utf8");
-        const converted = translator.translate(line);
+      parser.flush(line => {
+        const converted = translator.translate(line.toString("utf8"));
         if (converted) res.write(converted);
-      }
+      });
       res.end();
       const acc = translator.getAcc();
       if (acc.input_tokens || acc.output_tokens) {
@@ -257,13 +246,7 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
       finish();
     });
     upstreamBody.on("error", err => {
-      finish();
-      onBackendError(backend);
-      incMetric("upstream_errors");
-      const status = upstreamErrStatus(err);
-      ctx.err(status, err, { backend: backend.provider });
-      if (res.headersSent) { res.destroy(); return; }
-      json(res, status, { error: { message: String(err), type: "upstream_error", code: status } });
+      sendUpstreamError({ err, ctx, backend, res, req, finish, format: "anthropic" });
     });
   } else {
     const responseChunks = [];
@@ -278,22 +261,16 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
           duration_ms: Date.now() - ctx._start
         });
         const openaiResp = anthropicResponseToOpenAIChat(anthropicResp);
-        json(res, statusCode || 200, openaiResp);
+        json(res, statusCode || 200, openaiResp, req);
       } catch {
-        json(res, 502, { error: "Failed to convert Anthropic response to OpenAI format" });
+        json(res, 502, { error: "Failed to convert Anthropic response to OpenAI format" }, req);
       }
       onBackendSuccess(backend);
       ctx.end(statusCode || 200, { backend: backend.provider });
       finish();
     });
     upstreamBody.on("error", err => {
-      finish();
-      onBackendError(backend);
-      incMetric("upstream_errors");
-      const status = upstreamErrStatus(err);
-      ctx.err(status, err, { backend: backend.provider });
-      if (res.headersSent) { res.destroy(); return; }
-      json(res, status, { error: { message: String(err), type: "upstream_error", code: status } });
+      sendUpstreamError({ err, ctx, backend, res, req, finish, format: "anthropic" });
     });
   }
 }
@@ -316,11 +293,7 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
   try {
     up = await doUpstream(backendUrl, { method: "POST", headers, body: bodyBuf }, backend, ctx);
   } catch (err) {
-    incMetric("upstream_errors");
-    const status = upstreamErrStatus(err);
-    ctx.err(status, err, { backend: backend.provider });
-    if (res.headersSent) { res.destroy(); return; }
-    return json(res, status, { error: String(err) });
+    return sendUpstreamError({ err, ctx, backend, res, req });
   }
 
   const isStream = parsedBody.stream === true;
@@ -336,29 +309,20 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
   });
 
   if (isStream) {
-    let buf = null;
+    const parser = createSSEParser();
     let acc = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
 
     upstreamBody.on("data", chunk => {
-      buf = buf ? Buffer.concat([buf, chunk], buf.length + chunk.length) : chunk;
+      if (typeof ctx.markTTFT === "function") ctx.markTTFT();
       const outs = [];
-      let nl;
-      while ((nl = buf.indexOf(0x0A)) !== -1) {
-        const end = nl > 0 && buf[nl - 1] === 0x0D ? nl - 1 : nl;
-        const line = buf.subarray(0, end);
-        buf = buf.subarray(nl + 1);
-        if (line.length < 6 ||
-            line[0] !== 0x64 || line[1] !== 0x61 || line[2] !== 0x74 ||
-            line[3] !== 0x61 || line[4] !== 0x3A || line[5] !== 0x20) {
-          continue;
-        }
-        const d = line.subarray(6).toString("utf8").trim();
-        if (!d) continue;
-        if (d === "[DONE]") continue;
+      parser.feed(chunk, line => {
+        if (!isSSEDataLine(line)) return;
+        const d = sseDataPayload(line);
+        if (!d) return;
+        if (d === "[DONE]") return;
         try {
           const chunkObj = JSON.parse(d);
           if (chunkObj.usage) {
-            // merge — don't replace, in case a partial usage chunk arrives early
             const u = normalizeUsage(chunkObj.usage);
             if (u.input_tokens > 0) acc.input_tokens = u.input_tokens;
             if (u.output_tokens > 0) acc.output_tokens = u.output_tokens;
@@ -367,7 +331,7 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
           }
         } catch {}
         outs.push(line.toString("utf8") + "\n");
-      }
+      });
       if (outs.length > 0) res.write(outs.join(""));
     });
     upstreamBody.on("end", () => {
@@ -384,13 +348,7 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
       finish();
     });
     upstreamBody.on("error", err => {
-      finish();
-      onBackendError(backend);
-      incMetric("upstream_errors");
-      const status = upstreamErrStatus(err);
-      ctx.err(status, err, { backend: backend.provider });
-      if (res.headersSent) { res.destroy(); return; }
-      json(res, status, { error: String(err) });
+      sendUpstreamError({ err, ctx, backend, res, req, finish });
     });
   } else {
     const responseChunks = [];
@@ -415,13 +373,7 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
       finish();
     });
     upstreamBody.on("error", err => {
-      finish();
-      onBackendError(backend);
-      incMetric("upstream_errors");
-      const status = upstreamErrStatus(err);
-      ctx.err(status, err, { backend: backend.provider });
-      if (res.headersSent) { res.destroy(); return; }
-      json(res, status, { error: String(err) });
+      sendUpstreamError({ err, ctx, backend, res, req, finish });
     });
   }
 }
@@ -461,11 +413,7 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
   try {
     up = await doUpstream(upstreamUrl, { method: req.method, headers, body: bodyBuf }, backend, ctx);
   } catch (err) {
-    incMetric("upstream_errors");
-    const status = upstreamErrStatus(err);
-    ctx.err(status, err, { backend: backend.provider });
-    if (res.headersSent) { res.destroy(); return; }
-    return json(res, status, { error: String(err) });
+    return sendUpstreamError({ err, ctx, backend, res, req });
   }
 
   const { statusCode, headers: resHeaders, body: upstreamBody, finish } = up;
@@ -480,29 +428,24 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
   });
 
   if (isStream) {
-    let buf = null;
-    let acc = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
-    let modelName = "";
-
+    const parser = createSSEParser();
+    let acc = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, model: "" };
 
     upstreamBody.on("data", chunk => {
-      buf = buf ? Buffer.concat([buf, chunk], buf.length + chunk.length) : chunk;
+      if (typeof ctx.markTTFT === "function") ctx.markTTFT();
       const outs = [];
-      let nl;
-      while ((nl = buf.indexOf(0x0A)) !== -1) {
-        const end = nl > 0 && buf[nl - 1] === 0x0D ? nl - 1 : nl;
-        const line = buf.subarray(0, end).toString("utf8");
-        buf = buf.subarray(nl + 1);
-        parseAnthropicSSEUsage(line, acc);
-        outs.push(line + "\n");
-      }
+      parser.feed(chunk, line => {
+        const s = line.toString("utf8");
+        parseAnthropicSSEUsage(s, acc);
+        outs.push(s + "\n");
+      });
       if (outs.length > 0) res.write(outs.join(""));
     });
     upstreamBody.on("end", () => {
       res.end();
       if (acc.input_tokens || acc.output_tokens) {
         ctx.attachUsage(acc, {
-          model: modelName || backend.models?.[0] || "",
+          model: acc.model || backend.models?.[0] || "",
           stream: 1,
           duration_ms: Date.now() - ctx._start
         });
@@ -512,13 +455,7 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
       finish();
     });
     upstreamBody.on("error", err => {
-      finish();
-      onBackendError(backend);
-      incMetric("upstream_errors");
-      const status = upstreamErrStatus(err);
-      ctx.err(status, err, { backend: backend.provider });
-      if (res.headersSent) { res.destroy(); return; }
-      json(res, status, { error: String(err) });
+      sendUpstreamError({ err, ctx, backend, res, req, finish });
     });
   } else {
     const responseChunks = [];
@@ -543,13 +480,7 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
       finish();
     });
     upstreamBody.on("error", err => {
-      finish();
-      onBackendError(backend);
-      incMetric("upstream_errors");
-      const status = upstreamErrStatus(err);
-      ctx.err(status, err, { backend: backend.provider });
-      if (res.headersSent) { res.destroy(); return; }
-      json(res, status, { error: String(err) });
+      sendUpstreamError({ err, ctx, backend, res, req, finish });
     });
   }
 }
