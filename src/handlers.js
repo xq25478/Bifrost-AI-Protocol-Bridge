@@ -316,25 +316,27 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
       if (typeof ctx.markTTFT === "function") ctx.markTTFT();
       const outs = [];
       parser.feed(chunk, line => {
-        if (!isSSEDataLine(line)) return;
-        const d = sseDataPayload(line);
-        if (!d) return;
-        if (d === "[DONE]") return;
-        try {
-          const chunkObj = JSON.parse(d);
-          if (chunkObj.usage) {
-            const u = normalizeUsage(chunkObj.usage);
-            if (u.input_tokens > 0) acc.input_tokens = u.input_tokens;
-            if (u.output_tokens > 0) acc.output_tokens = u.output_tokens;
-            if (u.cache_read_tokens > 0) acc.cache_read_tokens = u.cache_read_tokens;
-            if (u.cache_write_tokens > 0) acc.cache_write_tokens = u.cache_write_tokens;
+        if (isSSEDataLine(line)) {
+          const d = sseDataPayload(line);
+          if (d && d !== "[DONE]") {
+            try {
+              const chunkObj = JSON.parse(d);
+              if (chunkObj.usage) {
+                const u = normalizeUsage(chunkObj.usage);
+                if (u.input_tokens > 0) acc.input_tokens = u.input_tokens;
+                if (u.output_tokens > 0) acc.output_tokens = u.output_tokens;
+                if (u.cache_read_tokens > 0) acc.cache_read_tokens = u.cache_read_tokens;
+                if (u.cache_write_tokens > 0) acc.cache_write_tokens = u.cache_write_tokens;
+              }
+            } catch {}
           }
-        } catch {}
+        }
         outs.push(line.toString("utf8") + "\n");
       });
       if (outs.length > 0) res.write(outs.join(""));
     });
     upstreamBody.on("end", () => {
+      parser.flush(line => { res.write(line.toString("utf8") + "\n"); });
       res.end();
       if (acc.input_tokens || acc.output_tokens) {
         ctx.attachUsage(acc, {
