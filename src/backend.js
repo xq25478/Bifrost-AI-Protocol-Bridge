@@ -267,7 +267,9 @@ function stopWatchBackends() {
 
 function resolveApiKey(req, backendApiKey) {
   if (backendApiKey) return backendApiKey;
-  const auth = req.headers.authorization || req.headers.Authorization;
+  // Node's HTTP parser lowercases header names — `req.headers.Authorization`
+  // is always undefined, so we only look up the lowercase form.
+  const auth = req.headers.authorization;
   if (auth && auth.toLowerCase().startsWith("bearer ")) {
     return auth.slice("bearer ".length).trim();
   }

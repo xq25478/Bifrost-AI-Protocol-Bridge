@@ -147,7 +147,7 @@ function requestlog(rid, method, path) {
   let _usage = null;
   let _usageExtra = null;
   let _bodySample = null;
-  let _inputChars = 0;
+  let _inputBytes = 0;
   let _upstreamStartMs = 0;
   let _upstreamMs = 0;
   let _ttftMs = 0;
@@ -172,7 +172,7 @@ function requestlog(rid, method, path) {
       ..._usageExtra,
       ttft_ms: _ttftMs | 0,
       itl_avg_ms: itl | 0,
-      input_chars: _inputChars | 0,
+      input_bytes: _inputBytes | 0,
       partial: !!partial,
     });
     _usage = null;
@@ -195,8 +195,8 @@ function requestlog(rid, method, path) {
     },
     attachBody(buf) {
       _bodySample = redactBodySample(buf);
-      if (Buffer.isBuffer(buf)) _inputChars = buf.length;
-      else if (typeof buf === "string") _inputChars = Buffer.byteLength(buf, "utf8");
+      if (Buffer.isBuffer(buf)) _inputBytes = buf.length;
+      else if (typeof buf === "string") _inputBytes = Buffer.byteLength(buf, "utf8");
     },
     markUpstream(phase) {
       if (phase === "start") _upstreamStartMs = Date.now();

@@ -20,11 +20,6 @@ describe("backend - resolveApiKey", () => {
     assert.strictEqual(resolveApiKey(req, ""), "sk-from-header");
   });
 
-  it("supports mixed-case Authorization header", () => {
-    const req = { headers: { Authorization: "Bearer sk-Mixed" } };
-    assert.strictEqual(resolveApiKey(req, ""), "sk-Mixed");
-  });
-
   it("returns empty string when no key is available", () => {
     const req = { headers: {} };
     assert.strictEqual(resolveApiKey(req, ""), "");

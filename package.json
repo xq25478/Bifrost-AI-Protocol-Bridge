@@ -1,5 +1,5 @@
 {
-  "name": "bifrost-gateway",
+  "name": "openproxyrouter",
   "version": "0.1.0",
   "private": true,
   "description": "Personal desktop AI protocol bridge between Anthropic and OpenAI clients",

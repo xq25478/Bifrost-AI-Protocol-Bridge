@@ -111,4 +111,67 @@ describe("store - sqlite persistence", () => {
     assert.notStrictEqual(before, after, "after insert+flush, query should not return cached object");
     assert.strictEqual(after.requests, before.requests + 1);
   });
+
+  it("tolerates out-of-band schema change without crashing", () => {
+    // Simulate another process performing a migration against the same DB
+    // while this process already holds a prepared INSERT targeting the old
+    // column name. This is the exact scenario that produced the real-world
+    // "table requests has no column named input_chars" error.
+    const BetterSQLite3 = require("better-sqlite3");
+    const raw = new BetterSQLite3(dbPath);
+    try {
+      raw.exec("ALTER TABLE requests RENAME COLUMN input_bytes TO scratch_col");
+    } finally {
+      raw.close();
+    }
+    try {
+      const now = Date.now();
+      assert.doesNotThrow(() => {
+        store.insertRequest({
+          rid: "schema-race", ts: now, model: "m", backend: "p", endpoint: "/x",
+          client_format: "x", stream: 0, status: 200, duration_ms: 1,
+          input_tokens: 1, output_tokens: 1, cache_read: 0, cache_write: 0,
+        });
+        store.flush();
+      });
+    } finally {
+      // Restore the column so `after` cleanup and any downstream tests do not
+      // inherit a broken schema.
+      const raw2 = new BetterSQLite3(dbPath);
+      try {
+        raw2.exec("ALTER TABLE requests RENAME COLUMN scratch_col TO input_bytes");
+      } finally {
+        raw2.close();
+      }
+    }
+  });
+
+  it("recovers batch inserts after recompiling a stale prepared statement", () => {
+    // Rename the column twice (input_bytes → tmp → input_bytes). The final
+    // schema is identical to the original, so a recompile of the INSERT
+    // succeeds — but the store's originally-prepared statement was compiled
+    // against the pre-rename column identity, so in a live DB with an
+    // out-of-band writer, re-preparing is what lets the insert succeed.
+    // We exercise this by forcing a flush through the repair path.
+    const BetterSQLite3 = require("better-sqlite3");
+    const raw = new BetterSQLite3(dbPath);
+    try {
+      raw.exec("ALTER TABLE requests RENAME COLUMN input_bytes TO tmp_mig");
+      raw.exec("ALTER TABLE requests RENAME COLUMN tmp_mig TO input_bytes");
+    } finally {
+      raw.close();
+    }
+    const now = Date.now();
+    store.insertRequest({
+      rid: "rerepare", ts: now, model: "m-reprepare", backend: "p", endpoint: "/x",
+      client_format: "x", stream: 0, status: 200, duration_ms: 1,
+      input_tokens: 7, output_tokens: 3, cache_read: 0, cache_write: 0,
+    });
+    store.flush();
+    const rows = store.queryAggregated(now - 100, now + 100);
+    const m = rows.find(r => r.model === "m-reprepare");
+    assert.ok(m, "the row inserted after schema round-trip should be visible");
+    assert.strictEqual(m.input_tokens, 7);
+    assert.strictEqual(m.output_tokens, 3);
+  });
 });

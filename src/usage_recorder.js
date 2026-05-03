@@ -112,6 +112,9 @@ function recordRequestUsage(entry) {
         output_tokens: norm.output_tokens,
         cache_read: norm.cache_read_tokens,
         cache_write: norm.cache_write_tokens,
+        ttft_ms: typeof entry.ttft_ms === "number" ? entry.ttft_ms : 0,
+        itl_avg_ms: typeof entry.itl_avg_ms === "number" ? entry.itl_avg_ms : 0,
+        input_bytes: typeof entry.input_bytes === "number" ? entry.input_bytes : 0,
       });
     } catch {}
   }
