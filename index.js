@@ -227,8 +227,6 @@ const server = http.createServer((req, res) => {
         return json(res, 400, { error: { type: "invalid_request_error", message: "Invalid JSON body" } }, req);
       }
 
-      normalizeThinking(parsedBody);
-
       const modelId = parsedBody.model;
       const route = modelIndex()[modelId];
       if (!route) {
@@ -238,6 +236,8 @@ const server = http.createServer((req, res) => {
 
       const { backend, modelId: backendModelId } = route;
       parsedBody.model = backendModelId;
+
+      normalizeThinking(parsedBody, backend);
 
       if (backend.type !== "anthropic") {
         ctx.end(501, { backend: backend.provider, model: modelId, msg: "count_tokens unsupported" });
@@ -411,7 +411,7 @@ const server = http.createServer((req, res) => {
       const { backend, modelId: backendModelId } = route;
 
       parsedBody.model = backendModelId;
-      normalizeThinking(parsedBody);
+      normalizeThinking(parsedBody, backend);
 
       ctx.on("route", { backend: backend.provider, model: modelId });
 

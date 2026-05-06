@@ -143,4 +143,62 @@ describe("backend - validateBackends", () => {
     ]);
     assert.strictEqual(r.ok, true);
   });
+
+  it("accepts valid thinking_format values", () => {
+    const formats = ["anthropic-standard", "bedrock-adaptive", "chat_template_kwargs", "reasoning_effort", "none"];
+    for (const f of formats) {
+      const r = validateBackends([
+        { type: "openai", provider: "P", baseUrl: "http://x", models: ["m"], thinking_format: f },
+      ]);
+      assert.strictEqual(r.ok, true, `format=${f}: ${r.errors.join(", ")}`);
+    }
+  });
+
+  it("rejects invalid thinking_format", () => {
+    const r = validateBackends([
+      { type: "openai", provider: "P", baseUrl: "http://x", models: ["m"], thinking_format: "bogus" },
+    ]);
+    assert.strictEqual(r.ok, false);
+    assert.ok(r.errors.some(e => /thinking_format/.test(e)), r.errors.join(", "));
+  });
+
+  it("rejects non-string thinking_format", () => {
+    const r = validateBackends([
+      { type: "openai", provider: "P", baseUrl: "http://x", models: ["m"], thinking_format: 42 },
+    ]);
+    assert.strictEqual(r.ok, false);
+    assert.ok(r.errors.some(e => /thinking_format/.test(e)));
+  });
+
+  it("accepts alias object entries {id, upstream}", () => {
+    const r = validateBackends([
+      { type: "openai", provider: "P", baseUrl: "http://x", models: [
+        "raw-name",
+        { id: "claude-sonnet-4-5", upstream: "raw-name" },
+      ] },
+    ]);
+    assert.strictEqual(r.ok, true, r.errors.join("; "));
+  });
+
+  it("rejects alias object missing id or upstream", () => {
+    const r1 = validateBackends([
+      { type: "openai", provider: "P", baseUrl: "http://x", models: [{ upstream: "m" }] },
+    ]);
+    assert.strictEqual(r1.ok, false);
+    assert.ok(r1.errors.some(e => /entry\.id/.test(e)), r1.errors.join(", "));
+
+    const r2 = validateBackends([
+      { type: "openai", provider: "P", baseUrl: "http://x", models: [{ id: "claude-x" }] },
+    ]);
+    assert.strictEqual(r2.ok, false);
+    assert.ok(r2.errors.some(e => /entry\.upstream/.test(e)), r2.errors.join(", "));
+  });
+
+  it("rejects non-string, non-object model entries", () => {
+    const r = validateBackends([
+      { type: "openai", provider: "P", baseUrl: "http://x", models: [42] },
+    ]);
+    assert.strictEqual(r.ok, false);
+    assert.ok(r.errors.some(e => /strings or \{id, upstream\}/.test(e)), r.errors.join(", "));
+  });
 });

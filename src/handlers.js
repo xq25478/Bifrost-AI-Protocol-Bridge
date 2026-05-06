@@ -63,7 +63,7 @@ function ctxMeta(ctx, backend, model, stream, endpoint, clientFormat) {
 }
 
 async function proxyOpenAIChat(req, res, ctx, backend, body) {
-  const openaiBody = anthropicBodyToOpenAIChat(body);
+  const openaiBody = anthropicBodyToOpenAIChat(body, backend);
   // Inject stream_options so the upstream OpenAI-compatible backend includes
   // usage data in streaming responses (needed for token accounting).
   const openaiBodyStr = injectStreamOptions(JSON.stringify(openaiBody));
@@ -176,7 +176,7 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
 
 async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
   const anthropicBody = openaiBodyToAnthropic(parsedBody);
-  normalizeThinking(anthropicBody);
+  normalizeThinking(anthropicBody, backend);
 
   const suffix = "/v1/messages";
   const fullUrl = backend.baseUrl.replace(/\/+$/, "") + suffix;

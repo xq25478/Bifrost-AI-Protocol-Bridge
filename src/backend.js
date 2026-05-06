@@ -4,6 +4,7 @@ const fs = require("fs");
 const { Agent: UndiciAgent, request: undiciRequest } = require("undici");
 const { system } = require("./logger");
 const { BACKENDS_PATH, TIMEOUT, DISPATCHER_OPTIONS, RETRYABLE_CODES, CIRCUIT_THRESHOLD, CIRCUIT_OPEN_MS } = require("./config");
+const { VALID_THINKING_FORMATS } = require("./thinking");
 
 let backends = [];
 let modelIndex = {};
@@ -160,16 +161,31 @@ function validateBackends(arr) {
     if (b.apiKey !== undefined && typeof b.apiKey !== "string") {
       errors.push(`${tag}: apiKey must be a string when present`);
     }
+    if (b.thinking_format !== undefined) {
+      if (typeof b.thinking_format !== "string" || !VALID_THINKING_FORMATS.has(b.thinking_format)) {
+        errors.push(`${tag}: thinking_format must be one of ${Array.from(VALID_THINKING_FORMATS).join(", ")}, got ${JSON.stringify(b.thinking_format)}`);
+      }
+    }
     if (!Array.isArray(b.models) || b.models.length === 0) {
       errors.push(`${tag}: models must be a non-empty array`);
     } else {
       for (const m of b.models) {
-        if (typeof m !== "string" || !m.trim()) {
-          errors.push(`${tag}: model entries must be non-empty strings, got ${JSON.stringify(m)}`);
-        } else if (seenModels.has(m)) {
-          // not a hard error — loadBackends will warn and skip duplicates
+        if (typeof m === "string") {
+          if (!m.trim()) {
+            errors.push(`${tag}: model entries must be non-empty strings, got ${JSON.stringify(m)}`);
+          } else if (!seenModels.has(m)) {
+            seenModels.add(m);
+          }
+        } else if (m && typeof m === "object" && !Array.isArray(m)) {
+          if (typeof m.id !== "string" || !m.id.trim()) {
+            errors.push(`${tag}: model entry.id must be a non-empty string, got ${JSON.stringify(m)}`);
+          } else if (typeof m.upstream !== "string" || !m.upstream.trim()) {
+            errors.push(`${tag}: model entry.upstream must be a non-empty string, got ${JSON.stringify(m)}`);
+          } else if (!seenModels.has(m.id)) {
+            seenModels.add(m.id);
+          }
         } else {
-          seenModels.add(m);
+          errors.push(`${tag}: model entries must be non-empty strings or {id, upstream} objects, got ${JSON.stringify(m)}`);
         }
       }
     }
@@ -205,17 +221,19 @@ function loadBackends() {
 
   for (const backend of newBackends) {
     for (let mi = 0; mi < backend.models.length; mi++) {
-      const modelId = backend.models[mi];
-      if (newIndex[modelId]) {
-        system("warn", `duplicate model id "${modelId}" in ${backend.provider} — first occurrence in ${newIndex[modelId].backend.provider} wins, skipped`,
-          { backend: backend.provider, model: modelId });
+      const entry = backend.models[mi];
+      const routeId = typeof entry === "string" ? entry : entry.id;
+      const upstreamId = typeof entry === "string" ? entry : entry.upstream;
+      if (newIndex[routeId]) {
+        system("warn", `duplicate model id "${routeId}" in ${backend.provider} — first occurrence in ${newIndex[routeId].backend.provider} wins, skipped`,
+          { backend: backend.provider, model: routeId });
         continue;
       }
-      newIndex[modelId] = { backend, modelId };
+      newIndex[routeId] = { backend, modelId: upstreamId };
       newList.push({
-        id: modelId,
+        id: routeId,
         type: "model",
-        display_name: modelId,
+        display_name: routeId,
         created_at: "2026-01-01T00:00:00Z"
       });
     }

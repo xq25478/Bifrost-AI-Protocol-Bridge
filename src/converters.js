@@ -2,12 +2,13 @@
 
 const crypto = require("crypto");
 const { normalizeUsage } = require("./usage_recorder");
+const { budgetToEffort } = require("./thinking");
 
 // ============================================================
 // Anthropic -> OpenAI Request
 // ============================================================
 
-function anthropicBodyToOpenAIChat(body) {
+function anthropicBodyToOpenAIChat(body, backend) {
   const messages = [];
   if (body.system && typeof body.system === "string") {
     messages.push({ role: "system", content: body.system });
@@ -114,7 +115,47 @@ function anthropicBodyToOpenAIChat(body) {
       if (tc.disable_parallel_tool_use) req.parallel_tool_calls = false;
     }
   }
+
+  applyThinkingToOpenAIRequest(req, body, backend);
+
   return req;
+}
+
+/**
+ * Inject the backend-specific thinking parameter into an OpenAI Chat request.
+ *
+ * Upstream OpenAI-compatible reasoner deployments disagree on wire format:
+ *   - vLLM / SGLang serving DeepSeek / Qwen / GLM: `chat_template_kwargs:
+ *     {enable_thinking, thinking_budget}` — and responses carry
+ *     `reasoning_content` alongside `content`.
+ *   - OpenAI o-series (and Azure): `reasoning_effort: "low"|"medium"|"high"`.
+ *
+ * `backend.thinking_format` selects which field to emit. Missing config
+ * defaults to `chat_template_kwargs` — the dominant shape across the
+ * open-source reasoner ecosystem we proxy to.
+ *
+ * When the caller disabled thinking (body.thinking === undefined after
+ * normalizeThinking stripped it, or explicit `{type:"disabled"}`), we do
+ * NOT touch the request, so providers that default reasoning ON (e.g.
+ * GLM-5.1) keep their behavior unless the caller actively opts in/out.
+ */
+function applyThinkingToOpenAIRequest(req, body, backend) {
+  const t = body && body.thinking;
+  if (!t || typeof t !== "object") return;
+  const format = (backend && backend.thinking_format) || "chat_template_kwargs";
+  const budget = typeof t.budget_tokens === "number" ? t.budget_tokens : undefined;
+  const enabled = t.type === "enabled" || t.type === "adaptive" || t.enabled === true || budget !== undefined;
+  if (!enabled) return;
+  if (format === "chat_template_kwargs") {
+    const kwargs = { ...(req.chat_template_kwargs || {}), enable_thinking: true };
+    if (budget !== undefined) kwargs.thinking_budget = budget;
+    req.chat_template_kwargs = kwargs;
+    return;
+  }
+  if (format === "reasoning_effort") {
+    req.reasoning_effort = budget !== undefined ? budgetToEffort(budget) : "medium";
+    return;
+  }
 }
 
 // ============================================================
@@ -125,6 +166,12 @@ function openaiChatResponseToAnthropic(openaiRes) {
   const choice = openaiRes.choices?.[0];
   const msg = choice?.message || {};
   const content = [];
+  // DeepSeek / GLM / Qwen reasoner deployments expose chain-of-thought in
+  // `message.reasoning_content`. Surface it as an Anthropic thinking block so
+  // Claude-format clients (e.g. Claude Code) can render the thinking UI.
+  if (typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0) {
+    content.push({ type: "thinking", thinking: msg.reasoning_content });
+  }
   // OpenAI allows content=null when tool_calls present; keep at least empty text
   if (typeof msg.content === "string") content.push({ type: "text", text: msg.content });
   if (Array.isArray(msg.tool_calls)) {
@@ -168,6 +215,8 @@ function openaiChatResponseToAnthropic(openaiRes) {
 
 function createOpenAIToAnthropicSSETranslator(msgId, model) {
   let started = false;
+  let thinkingOpen = false;
+  let thinkingIndex = -1;
   let textOpen = false;
   let textIndex = -1;
   const toolBlocks = new Map();
@@ -185,6 +234,22 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
         usage: { input_tokens: 0, output_tokens: 0 }
       }
     })}\n\n`;
+  }
+
+  function openThinking() {
+    if (thinkingOpen) return "";
+    thinkingOpen = true;
+    thinkingIndex = nextIndex++;
+    return `data: ${JSON.stringify({
+      type: "content_block_start", index: thinkingIndex,
+      content_block: { type: "thinking", thinking: "" }
+    })}\n\n`;
+  }
+
+  function closeThinking() {
+    if (!thinkingOpen) return "";
+    thinkingOpen = false;
+    return `data: ${JSON.stringify({ type: "content_block_stop", index: thinkingIndex })}\n\n`;
   }
 
   function openText() {
@@ -211,6 +276,10 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
 
   function closeAll() {
     const parts = [];
+    if (thinkingOpen) {
+      parts.push(`data: ${JSON.stringify({ type: "content_block_stop", index: thinkingIndex })}\n\n`);
+      thinkingOpen = false;
+    }
     if (textOpen) {
       parts.push(`data: ${JSON.stringify({ type: "content_block_stop", index: textIndex })}\n\n`);
       textOpen = false;
@@ -249,6 +318,18 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
 
       const hasToolCalls = Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0;
       const hasText = typeof delta.content === "string" && delta.content.length > 0;
+      const hasReasoning = typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0;
+
+      // Reasoning streams before content; thinking block must close before
+      // any text or tool_use block opens in the same chunk.
+      if (hasReasoning) {
+        if (!thinkingOpen) parts.push(openThinking());
+        parts.push(`data: ${JSON.stringify({
+          type: "content_block_delta", index: thinkingIndex,
+          delta: { type: "thinking_delta", thinking: delta.reasoning_content }
+        })}\n\n`);
+      }
+      if ((hasText || hasToolCalls) && thinkingOpen) parts.push(closeThinking());
 
       // Close text block BEFORE opening tool blocks when both appear in same chunk
       if (hasToolCalls && textOpen) parts.push(closeText());

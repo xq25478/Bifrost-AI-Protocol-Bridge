@@ -111,6 +111,36 @@ describe("anthropicBodyToOpenAIChat", () => {
     });
     assert.strictEqual(resultNone.tool_choice, "none");
   });
+
+  it("injects chat_template_kwargs by default when thinking is enabled", () => {
+    const result = anthropicBodyToOpenAIChat({
+      model: "x", max_tokens: 100, messages: [{ role: "user", content: "Hi" }],
+      thinking: { type: "enabled", budget_tokens: 4096 },
+    });
+    assert.deepStrictEqual(result.chat_template_kwargs, {
+      enable_thinking: true,
+      thinking_budget: 4096,
+    });
+    assert.strictEqual(result.reasoning_effort, undefined);
+  });
+
+  it("honors backend.thinking_format=reasoning_effort with budget bucketing", () => {
+    const backend = { type: "openai", thinking_format: "reasoning_effort" };
+    const result = anthropicBodyToOpenAIChat({
+      model: "x", max_tokens: 100, messages: [{ role: "user", content: "Hi" }],
+      thinking: { type: "enabled", budget_tokens: 20000 },
+    }, backend);
+    assert.strictEqual(result.reasoning_effort, "high");
+    assert.strictEqual(result.chat_template_kwargs, undefined);
+  });
+
+  it("does not add thinking params when thinking is absent", () => {
+    const result = anthropicBodyToOpenAIChat({
+      model: "x", max_tokens: 100, messages: [{ role: "user", content: "Hi" }],
+    });
+    assert.strictEqual(result.chat_template_kwargs, undefined);
+    assert.strictEqual(result.reasoning_effort, undefined);
+  });
 });
 
 describe("openaiChatResponseToAnthropic", () => {
@@ -167,6 +197,34 @@ describe("openaiChatResponseToAnthropic", () => {
     const res = { choices: [{ message: { content: "x" }, finish_reason: "length" }] };
     const result = openaiChatResponseToAnthropic(res);
     assert.strictEqual(result.stop_reason, "max_tokens");
+  });
+
+  it("maps reasoning_content to a thinking block before the text block", () => {
+    const res = {
+      choices: [{
+        message: {
+          role: "assistant",
+          content: "42",
+          reasoning_content: "Let me compute 13+29: 13+29=42",
+        },
+        finish_reason: "stop",
+      }],
+    };
+    const result = openaiChatResponseToAnthropic(res);
+    assert.strictEqual(result.content[0].type, "thinking");
+    assert.strictEqual(result.content[0].thinking, "Let me compute 13+29: 13+29=42");
+    assert.strictEqual(result.content[1].type, "text");
+    assert.strictEqual(result.content[1].text, "42");
+  });
+
+  it("omits thinking block when reasoning_content is null or empty", () => {
+    for (const rc of [null, "", undefined]) {
+      const res = {
+        choices: [{ message: { content: "hi", reasoning_content: rc }, finish_reason: "stop" }],
+      };
+      const result = openaiChatResponseToAnthropic(res);
+      assert.ok(result.content.every(b => b.type !== "thinking"), `rc=${JSON.stringify(rc)}`);
+    }
   });
 });
 
@@ -233,6 +291,44 @@ describe("createOpenAIToAnthropicSSETranslator", () => {
       usage: { completion_tokens: 10, prompt_tokens: 5 }
     });
     assert.strictEqual(t.getUsage().completion_tokens, 10);
+  });
+
+  it("opens a thinking block for streaming reasoning_content and emits thinking_delta", () => {
+    const t = createOpenAIToAnthropicSSETranslator("msg_1", "deepseek-v4");
+    const out = t.translate({ choices: [{ delta: { reasoning_content: "First step:" }, finish_reason: null }] });
+    assert.ok(out.includes("message_start"));
+    assert.ok(out.includes('"type":"thinking"'));
+    assert.ok(out.includes('"thinking_delta"'));
+    assert.ok(out.includes("First step:"));
+  });
+
+  it("closes thinking block before opening text block when content starts", () => {
+    const t = createOpenAIToAnthropicSSETranslator("msg_1", "deepseek-v4");
+    t.translate({ choices: [{ delta: { reasoning_content: "thinking..." }, finish_reason: null }] });
+    const out = t.translate({ choices: [{ delta: { content: "answer" }, finish_reason: null }] });
+    const thinkingStopIdx = out.indexOf("content_block_stop");
+    const textStartIdx = out.indexOf('"type":"text"');
+    assert.ok(thinkingStopIdx !== -1, "thinking block must close");
+    assert.ok(textStartIdx !== -1, "text block must open");
+    assert.ok(thinkingStopIdx < textStartIdx, "thinking must close before text opens");
+  });
+
+  it("uses distinct indices for thinking and text content blocks", () => {
+    const t = createOpenAIToAnthropicSSETranslator("msg_1", "deepseek-v4");
+    t.translate({ choices: [{ delta: { reasoning_content: "R" }, finish_reason: null }] });
+    t.translate({ choices: [{ delta: { content: "T" }, finish_reason: null }] });
+    const final = t.finalize();
+    // Final should close at least one block
+    assert.ok(final.includes("content_block_stop"));
+    assert.ok(final.includes("message_stop"));
+  });
+
+  it("closes thinking block on finish even without text", () => {
+    const t = createOpenAIToAnthropicSSETranslator("msg_1", "deepseek-v4");
+    t.translate({ choices: [{ delta: { reasoning_content: "only thinking" }, finish_reason: null }] });
+    const out = t.translate({ choices: [{ delta: {}, finish_reason: "stop" }] });
+    assert.ok(out.includes("content_block_stop"));
+    assert.ok(out.includes("message_stop"));
   });
 });
 

@@ -90,7 +90,7 @@ async function proxyResponsesAsOpenAI(req, res, ctx, backend, reqBody) {
 async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
   const chatBody = responsesBodyToOpenAIChat(reqBody);
   const anthropicBody = openaiBodyToAnthropic(chatBody);
-  normalizeThinking(anthropicBody);
+  normalizeThinking(anthropicBody, backend);
 
   const suffix = "/v1/messages";
   const fullUrl = backend.baseUrl.replace(/\/+$/, "") + suffix;
