@@ -710,7 +710,7 @@ function openaiBodyToAnthropic(body) {
   }
 
   // Map Chat-side reasoning hints back to Anthropic `thinking`. Two shapes are
-  // recognized so Responses→Chat→Anthropic and Chat→Anthropic both preserve
+  // recognized so Responses→Chat and Chat→Anthropic paths both preserve
   // reasoning intent without any extra wire field:
   //   - OpenAI o-series: `reasoning_effort: "low"|"medium"|"high"|"xhigh"|"max"`
   //   - vLLM / SGLang / DeepSeek / GLM: `chat_template_kwargs.enable_thinking`

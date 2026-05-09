@@ -9,6 +9,11 @@ const {
   createOpenAIChatToResponsesSSETranslator,
   usageToResponsesShape,
 } = require("./converters_responses");
+const {
+  responsesBodyToAnthropic,
+  anthropicResponseToResponses,
+  createAnthropicToResponsesSSETranslator,
+} = require("./converters_responses_anthropic");
 
 // ============================================================
 // responsesBodyToOpenAIChat
@@ -207,6 +212,81 @@ test("responsesBodyToOpenAIChat - reasoning between function_calls does not spli
   assert.strictEqual(assistantMsgs[0].tool_calls.length, 2);
   assert.strictEqual(assistantMsgs[0].tool_calls[0].function.name, "a");
   assert.strictEqual(assistantMsgs[0].tool_calls[1].function.name, "b");
+});
+
+// ============================================================
+// Direct Responses <-> Anthropic
+// ============================================================
+
+test("responsesBodyToAnthropic - maps function calls directly to tool_use/tool_result", () => {
+  const anth = responsesBodyToAnthropic({
+    model: "claude",
+    instructions: "Be terse.",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "weather?" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Checking." }] },
+      { type: "function_call", call_id: "call_1", name: "get_weather", arguments: '{"city":"NYC"}' },
+      { type: "function_call_output", call_id: "call_1", output: "72F" },
+    ],
+    tools: [{ type: "function", name: "get_weather", parameters: { type: "object", properties: {} } }],
+    parallel_tool_calls: false,
+  });
+
+  assert.strictEqual(anth.system, "Be terse.");
+  assert.strictEqual(anth.messages[1].role, "assistant");
+  assert.deepStrictEqual(anth.messages[1].content[1], {
+    type: "tool_use",
+    id: "call_1",
+    name: "get_weather",
+    input: { city: "NYC" },
+  });
+  assert.strictEqual(anth.messages[2].role, "user");
+  assert.deepStrictEqual(anth.messages[2].content[0], {
+    type: "tool_result",
+    tool_use_id: "call_1",
+    content: "72F",
+  });
+  assert.strictEqual(anth.tool_choice.disable_parallel_tool_use, true);
+  assert.ok(!JSON.stringify(anth).includes("tool_calls"), "direct Anthropic body must not contain Chat tool_calls");
+});
+
+test("responsesBodyToAnthropic - mixed text and image content becomes Anthropic blocks", () => {
+  const anth = responsesBodyToAnthropic({
+    model: "claude",
+    input: [{ type: "message", role: "user", content: [
+      { type: "input_text", text: "describe" },
+      { type: "input_image", image_url: "data:image/png;base64,abc" },
+    ] }],
+  });
+  assert.ok(Array.isArray(anth.messages[0].content));
+  assert.strictEqual(anth.messages[0].content[0].type, "text");
+  assert.deepStrictEqual(anth.messages[0].content[1], {
+    type: "image",
+    source: { type: "base64", media_type: "image/png", data: "abc" },
+  });
+});
+
+test("anthropicResponseToResponses - maps text, thinking, and tool_use directly", () => {
+  const resp = anthropicResponseToResponses({
+    id: "msg_1",
+    model: "claude",
+    content: [
+      { type: "thinking", thinking: "plan" },
+      { type: "text", text: "Use a tool." },
+      { type: "tool_use", id: "toolu_1", name: "search", input: { q: "x" } },
+    ],
+    stop_reason: "tool_use",
+    usage: { input_tokens: 8, output_tokens: 4 },
+  }, { model: "claude" });
+
+  assert.strictEqual(resp.output[0].type, "reasoning");
+  assert.strictEqual(resp.output[0].summary[0].text, "plan");
+  assert.strictEqual(resp.output[1].type, "message");
+  assert.strictEqual(resp.output[1].content[0].text, "Use a tool.");
+  assert.strictEqual(resp.output[2].type, "function_call");
+  assert.strictEqual(resp.output[2].call_id, "toolu_1");
+  assert.strictEqual(resp.output[2].arguments, '{"q":"x"}');
+  assert.strictEqual(resp.output_text, "Use a tool.");
 });
 
 // ============================================================
@@ -418,6 +498,42 @@ test("ChatToResponsesSSETranslator - finalize is idempotent", () => {
   const second = t.finalize();
   assert.ok(first.length > 0);
   assert.strictEqual(second, "");
+});
+
+test("AnthropicToResponsesSSETranslator - streams text and tool_use without Chat chunks", () => {
+  const t = createAnthropicToResponsesSSETranslator("claude", { model: "claude" });
+  const out = [
+    t.translate('data: {"type":"message_start","message":{"id":"msg_1","model":"claude","usage":{"input_tokens":8,"output_tokens":0}}}'),
+    t.translate('data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}'),
+    t.translate('data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Checking."}}'),
+    t.translate('data: {"type":"content_block_stop","index":0}'),
+    t.translate('data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"search","input":{}}}'),
+    t.translate('data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"q\\":"}}'),
+    t.translate('data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\\"x\\"}"}}'),
+    t.translate('data: {"type":"content_block_stop","index":1}'),
+    t.translate('data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":6}}'),
+    t.translate('data: {"type":"message_stop"}'),
+    t.finalize(),
+  ].join("");
+  const events = parseResponsesSSE(out);
+  assert.ok(events.some(e => e.event === "response.output_text.delta"));
+  assert.ok(events.some(e => e.event === "response.function_call_arguments.delta"));
+  const done = events.find(e => e.event === "response.function_call_arguments.done");
+  assert.strictEqual(done.data.arguments, '{"q":"x"}');
+  const completed = events.find(e => e.event === "response.completed");
+  assert.strictEqual(completed.data.response.output_text, "Checking.");
+  assert.strictEqual(completed.data.response.output[1].call_id, "toolu_1");
+  assert.deepStrictEqual(completed.data.response.usage, { input_tokens: 8, output_tokens: 6, total_tokens: 14 });
+});
+
+test("AnthropicToResponsesSSETranslator - Anthropic error event becomes response.failed", () => {
+  const t = createAnthropicToResponsesSSETranslator("claude", {});
+  const out = t.translate('data: {"type":"error","error":{"type":"overloaded_error","message":"try later"}}') + t.finalize();
+  const events = parseResponsesSSE(out);
+  const failed = events.find(e => e.event === "response.failed");
+  assert.ok(failed);
+  assert.strictEqual(failed.data.response.status, "failed");
+  assert.strictEqual(failed.data.response.error.message, "try later");
 });
 
 // ============================================================

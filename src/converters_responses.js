@@ -5,17 +5,17 @@
  *
  * Rationale: Responses API is the newer surface; Chat Completions is still the
  * common wire format supported by every OpenAI-compatible backend we care
- * about. Going Responses <-> Chat lets us compose with existing Chat <->
- * Anthropic converters for backends that speak Messages API, without any
- * duplicated protocol glue.
+ * about. Anthropic Messages has its own direct converter in
+ * converters_responses_anthropic.js so Responses items do not have to pass
+ * through Chat when the upstream backend speaks Anthropic.
  *
  * Unsupported Responses features (documented, not silently altered):
  *   - store / previous_response_id : the gateway is stateless, conversation
  *     state must be managed client-side
  *   - hosted tools (web_search_preview / file_search / computer_use / code_interpreter)
  *     : dropped from request; backends must not rely on hosted execution
- *   - reasoning summary events : passthrough for openai backends, dropped for
- *     anthropic backends (no equivalent signal)
+ *   - reasoning input items : dropped while downgrading request history to
+ *     Chat, except for reasoning.effort which maps to reasoning_effort
  */
 
 const crypto = require("crypto");

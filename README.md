@@ -81,7 +81,7 @@ In short: **your client code never changes. Switch models by changing one string
 - **Persistent storage**: SQLite (WAL mode, batched writes) with 365-day retention — survives restarts
 - **Accurate token capture**: Captures usage from all 8 client-backend path combinations (streaming and non-streaming, passthrough and converted) via the API response data
 - **Thinking adaptation**: Auto-normalize `thinking.enabled` to AWS Bedrock-compatible `adaptive`
-- **Tested**: 194 unit tests covering converters (Chat ↔ Anthropic, Responses ↔ Chat), thinking, metrics, token estimation, usage recording, SSE parsing, circuit breaker, startup banner, and persistent-store schema resilience
+- **Tested**: 284 unit tests covering direct converters (Chat ↔ Anthropic, Responses ↔ Chat, Responses ↔ Anthropic), thinking, metrics, token estimation, usage recording, SSE parsing, circuit breaker, startup banner, and persistent-store schema resilience
 
 ## Quick Start
 
@@ -236,34 +236,39 @@ Visit `https://127.0.0.1:8443/anthropic/v1/models` in a browser — you should g
   rm -rf /path/to/OpenProxyRouter
   ```
 
-## Bi-directional Protocol Conversion
+## Direct Protocol Conversion
 
-This is the project's **core capability**. The four combinations:
+This is the project's **core capability**. OpenProxyRouter now treats the three public client surfaces as first-class protocol pairs:
+
+- OpenAI Chat Completions ↔ Anthropic Messages
+- OpenAI Responses ↔ OpenAI Chat Completions
+- OpenAI Responses ↔ Anthropic Messages
+
+Routing is still selected only by `model`; the gateway chooses the direct converter for the matched backend protocol.
 
 | Client protocol | Backend type | Handling | Typical use |
 |:---------:|:---------:|:--------:|:--------|
-| **OpenAI** `/v1/chat/completions` | `anthropic` | **Convert** | OpenAI SDK → Claude |
-| **OpenAI** `/v1/chat/completions` | `openai` | Passthrough | OpenAI SDK → GPT / DeepSeek |
-| **OpenAI** `/v1/responses` | `openai` | **Convert** (Responses → Chat) | Codex / OpenAI SDK (Responses) → GPT / DeepSeek |
-| **OpenAI** `/v1/responses` | `anthropic` | **Convert** (Responses → Chat → Anthropic) | Codex / OpenAI SDK (Responses) → Claude |
-| **Anthropic** `/v1/messages` | `anthropic` | Passthrough | Claude Code Desktop → Claude |
-| **Anthropic** `/v1/messages` | `openai` | **Convert** | Claude Code Desktop → GPT |
+| **OpenAI Chat** `/v1/chat/completions` | `anthropic` | **Direct convert** (Chat ↔ Anthropic) | OpenAI SDK → Claude |
+| **OpenAI Chat** `/v1/chat/completions` | `openai` | Passthrough | OpenAI SDK → GPT / DeepSeek |
+| **OpenAI Responses** `/v1/responses` | `openai` | **Direct convert** (Responses ↔ Chat) | Codex / OpenAI SDK (Responses) → GPT / DeepSeek |
+| **OpenAI Responses** `/v1/responses` | `anthropic` | **Direct convert** (Responses ↔ Anthropic) | Codex / OpenAI SDK (Responses) → Claude |
+| **Anthropic Messages** `/v1/messages` | `anthropic` | Passthrough | Claude Code Desktop → Claude |
+| **Anthropic Messages** `/v1/messages` | `openai` | **Direct convert** (Anthropic ↔ Chat) | Claude Code Desktop → GPT |
 
-Conversion coverage:
+Cross-protocol coverage:
 
-| Feature | OpenAI → Anthropic | Anthropic → OpenAI |
-|------|:------------------:|:------------------:|
-| Basic chat | ✅ | ✅ |
-| System prompt | ✅ | ✅ |
-| Streaming SSE (token-by-token) | ✅ | ✅ |
-| Tool calls / function calling | ✅ | ✅ |
-| Multi-turn tool_result | ✅ | ✅ |
-| Image input (base64 / URL) | ✅ | - |
-| Stop sequences | ✅ | ✅ |
-| Temperature / top_p | ✅ | ✅ |
-| Usage stats (incl. cache tokens) | ✅ | ✅ |
-| finish_reason ↔ stop_reason | ✅ | ✅ |
-| Thinking normalization | ✅ | ✅ |
+| Feature | Chat ↔ Anthropic | Responses ↔ Chat | Responses ↔ Anthropic |
+|------|:------------------:|:----------------:|:---------------------:|
+| Basic text turns | ✅ | ✅ | ✅ |
+| System / developer instructions | ✅ | ✅ | ✅ |
+| Streaming SSE | ✅ | ✅ | ✅ |
+| Tool calls / function calling | ✅ | ✅ | ✅ |
+| Tool results / function_call_output history | ✅ | ✅ | ✅ |
+| Image input (base64 / URL) | ✅ | ✅ | ✅ |
+| Stop / finish / incomplete mapping | ✅ | ✅ | ✅ |
+| Temperature / top_p / max token controls | ✅ | ✅ | ✅ |
+| Usage stats (including cache tokens) | ✅ | ✅ | ✅ |
+| Thinking / reasoning normalization | ✅ | ✅ | ✅ |
 
 ## Client Integration
 
@@ -359,7 +364,7 @@ client = OpenAI(
 resp = client.responses.create(model="gpt-4o", input="Hello")
 print(resp.output_text)
 
-# Call Claude through the Responses API (Responses → Chat → Anthropic conversion)
+# Call Claude through the Responses API (direct Responses ↔ Anthropic conversion)
 resp = client.responses.create(model="Claude-Opus-4.7", input="Hello")
 print(resp.output_text)
 
@@ -407,7 +412,7 @@ In Settings → Gateway:
 
 All configured models appear in the model dropdown, including GPT / DeepSeek etc.
 
-### curl quick test (all 4 combinations)
+### curl quick test (all 6 routes)
 
 ```bash
 # 1. OpenAI protocol → Anthropic backend (convert)
@@ -437,7 +442,7 @@ curl -k https://127.0.0.1:8443/anthropic/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-4o","input":"hi"}'
 
-# 6. OpenAI Responses protocol → Anthropic backend (convert Responses → Chat → Anthropic)
+# 6. OpenAI Responses protocol → Anthropic backend (direct Responses ↔ Anthropic conversion)
 curl -k https://127.0.0.1:8443/anthropic/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{"model":"Claude-Opus-4.7","input":"hi"}'
@@ -447,7 +452,11 @@ curl -k https://127.0.0.1:8443/anthropic/v1/responses \
 
 The `/v1/responses` endpoint accepts the newer OpenAI Responses request shape and
 emits Responses-style SSE (`response.created`, `response.output_text.delta`,
-`response.completed`, etc.). Supported surface:
+`response.completed`, etc.). For OpenAI-compatible backends it converts directly
+between Responses and Chat Completions; for Anthropic backends it converts
+directly between Responses items and Anthropic content blocks.
+
+Supported surface:
 
 | Feature | Supported |
 |---|---|
@@ -456,7 +465,7 @@ emits Responses-style SSE (`response.created`, `response.output_text.delta`,
 | `instructions` (mapped to a leading system message) | ✅ |
 | `tools` (function tools, flat shape) + `tool_choice` + `parallel_tool_calls` | ✅ |
 | Streaming SSE with canonical event sequence & `sequence_number` | ✅ |
-| `max_output_tokens` (renamed internally to `max_tokens`) | ✅ |
+| `max_output_tokens` | ✅ |
 | `reasoning.effort` (passed through to models that support it) | ✅ |
 | `usage.input_tokens_details.cached_tokens` | ✅ |
 | Hosted tools (`web_search_preview`, `file_search`, `code_interpreter`) | ❌ dropped silently — gateway is stateless |
@@ -889,7 +898,7 @@ The names in `models` are passed **as-is** as the upstream request's `model` fie
 
 ### Anthropic client → OpenAI backend: where did `thinking` output go?
 
-OpenAI doesn't support reasoning blocks yet — the gateway merges Anthropic-style thinking into regular `content`. The reverse direction (OpenAI → Anthropic) behaves the same. See Roadmap.
+Chat-compatible reasoning backends commonly expose streamed thinking as `reasoning_content`; the gateway preserves Anthropic `thinking` blocks through that field where supported. Responses clients receive reasoning as `reasoning` output items. Backends that do not expose a dedicated reasoning field may still omit this data.
 
 ### `node: command not found` / `caddy: command not found`
 
@@ -927,7 +936,7 @@ A: Add one `type: "openai"` entry to `backends.json`. DeepSeek, Moonshot, Qwen, 
 A: Yes. The gateway normalizes `thinking.enabled: true` / `thinking.budget_tokens` to `thinking.type: "adaptive"` (AWS Bedrock doesn't support the former).
 
 **Q: What happens to reasoning / extended thinking when an OpenAI client calls Claude?**
-A: Currently, Anthropic's thinking blocks are merged into `content` when converting back to OpenAI format. PRs for dedicated field support welcome.
+A: The gateway maps Anthropic `thinking` blocks to Chat `reasoning_content` where the client/backend understands it, and to Responses `reasoning` output items on `/v1/responses`. Reasoning controls are normalized per backend with `thinking_format`.
 
 **Q: What does the response `model` field show?**
 A: The upstream's actual model name. Your client's `model` request field is mapped to the backend's real model name.
@@ -955,15 +964,21 @@ openproxyrouter/
 │   ├── metrics.js         # In-memory metrics + P50/P95/P99 latency
 │   ├── backend.js         # Backend registry, upstream calls, circuit breaker
 │   ├── thinking.js        # Thinking configuration normalization
-│   ├── converters.js      # All 4 protocol converters + SSE translators + parseAnthropicSSEUsage
-│   ├── handlers.js        # All 4 proxy handlers with 8 capture points for token usage
+│   ├── converters.js      # Chat ↔ Anthropic converters + SSE translators + parseAnthropicSSEUsage
+│   ├── converters_responses.js
+│   │                       # Responses ↔ Chat converters + SSE translators
+│   ├── converters_responses_anthropic.js
+│   │                       # Direct Responses ↔ Anthropic converters + SSE translators
+│   ├── handlers.js        # Chat/Messages proxy handlers with token usage capture
+│   ├── handlers_responses.js
+│   │                       # Responses proxy handlers for OpenAI and Anthropic backends
 │   ├── http_utils.js      # JSON response helper
 │   ├── usage_recorder.js  # Central token usage normalization + recording seam
 │   ├── store.js           # SQLite persistence: WAL, batched writes, 365d retention, analytics queries
 │   ├── dashboard_html.js  # Web dashboard UI (inline SVG charts, time-range filtering, per-model metrics)
-│   └── *.test.js          # 194 unit tests
+│   └── *.test.js          # 284 unit tests
 ├── start.sh               # Launch & supervise script (Heimdall)
-├── package.json           # Declares undici as sole runtime dependency
+├── package.json           # Node scripts and runtime dependencies
 ├── backends.json          # Backend config, gitignored (create manually)
 ├── README.md              # English (this file)
 ├── README.zh.md           # Chinese

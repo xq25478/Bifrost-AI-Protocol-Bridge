@@ -354,6 +354,59 @@ describe("handlers_responses - proxyResponsesAsAnthropic", () => {
     }
   });
 
+  it("sends a direct Anthropic body for Responses tool history", async () => {
+    const upstream = new EventEmitter();
+    const backendPath = require.resolve("./backend");
+    const handlersPath = require.resolve("./handlers_responses");
+    delete require.cache[handlersPath];
+    const backend = require("./backend");
+    const orig = backend.doUpstream;
+    let capturedBody = null;
+    backend.doUpstream = async (_url, opts) => {
+      capturedBody = JSON.parse(opts.body.toString("utf8"));
+      return { statusCode: 200, headers: {}, body: upstream, finish: () => {} };
+    };
+    const handlers = require("./handlers_responses");
+    try {
+      const req = { headers: {}, method: "POST" };
+      const res = makeFakeRes();
+      const ctx = makeCtx();
+      const backendCfg = { provider: "test", baseUrl: "https://api.anthropic.com", apiKey: "k", type: "anthropic" };
+      const reqBody = {
+        model: "claude",
+        stream: false,
+        input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: "run" }] },
+          { type: "function_call", call_id: "call_1", name: "shell", arguments: '{"cmd":"pwd"}' },
+          { type: "function_call_output", call_id: "call_1", output: "/tmp" },
+        ],
+      };
+
+      const p = handlers.proxyResponsesAsAnthropic(req, res, ctx, backendCfg, reqBody);
+      await new Promise(r => setImmediate(r));
+      upstream.emit("data", Buffer.from(JSON.stringify({
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        model: "claude",
+        content: [{ type: "text", text: "done" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 5, output_tokens: 1 },
+      })));
+      upstream.emit("end");
+      await p;
+
+      assert.strictEqual(capturedBody.messages[1].content[0].type, "tool_use");
+      assert.strictEqual(capturedBody.messages[1].content[0].id, "call_1");
+      assert.strictEqual(capturedBody.messages[2].content[0].type, "tool_result");
+      assert.ok(!JSON.stringify(capturedBody).includes("tool_calls"), "Responses→Anthropic must not pass through Chat tool_calls");
+    } finally {
+      backend.doUpstream = orig;
+      delete require.cache[handlersPath];
+      delete require.cache[backendPath];
+    }
+  });
+
   it("translates Anthropic SSE stream to Responses events end-to-end", async () => {
     const upstream = new EventEmitter();
     const { handlers, restore } = loadHandlersWithMockUpstream(upstream);
@@ -392,4 +445,3 @@ describe("handlers_responses - proxyResponsesAsAnthropic", () => {
     }
   });
 });
-

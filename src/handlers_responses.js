@@ -8,9 +8,9 @@
  *   proxyResponsesAsOpenAI(...)      Responses client  -> OpenAI (Chat) backend
  *   proxyResponsesAsAnthropic(...)   Responses client  -> Anthropic backend
  *
- * Both translate the inbound Responses request into OpenAI Chat Completions
- * (the common canonical form), hand off to the existing upstream plumbing,
- * and wrap the returning stream/non-stream with a Chat -> Responses converter.
+ * OpenAI-compatible backends still use Chat Completions as their common wire
+ * shape. Anthropic backends use direct Responses<->Messages conversion so item
+ * and content-block semantics do not pass through an unrelated protocol.
  */
 
 const {
@@ -19,10 +19,10 @@ const {
   createOpenAIChatToResponsesSSETranslator,
 } = require("./converters_responses");
 const {
-  openaiBodyToAnthropic,
-  anthropicResponseToOpenAIChat,
-  createAnthropicToOpenAISSETranslator,
-} = require("./converters");
+  responsesBodyToAnthropic,
+  anthropicResponseToResponses,
+  createAnthropicToResponsesSSETranslator,
+} = require("./converters_responses_anthropic");
 const {
   doUpstream, upstreamErrStatus, onBackendError, onBackendSuccess, resolveApiKey,
 } = require("./backend");
@@ -87,13 +87,12 @@ async function proxyResponsesAsOpenAI(req, res, ctx, backend, reqBody) {
 }
 
 /**
- * Responses → Chat → Anthropic (forward) → Anthropic → Chat → Responses.
- * The two-stage translation reuses existing Chat<->Anthropic converters so
- * we don't duplicate tool-call / image / system-prompt handling.
+ * Responses → Anthropic (forward) → Responses.
+ * Uses the direct Responses<->Anthropic converters so Responses items and
+ * Anthropic content blocks do not lose shape through an intermediate protocol.
  */
 async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
-  const chatBody = responsesBodyToOpenAIChat(reqBody);
-  const anthropicBody = openaiBodyToAnthropic(chatBody);
+  const anthropicBody = responsesBodyToAnthropic(reqBody);
   normalizeThinking(anthropicBody, backend);
 
   const suffix = "/v1/messages";
@@ -128,11 +127,7 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
   }
 
   if (anthropicBody.stream) {
-    // Compose two SSE translators: Anthropic SSE -> Chat SSE -> Responses SSE.
-    const crypto = require("crypto");
-    const chatId = "chatcmpl-" + crypto.randomUUID().replace(/-/g, "").slice(0, 24);
-    const anthToChat = createAnthropicToOpenAISSETranslator(chatId, reqBody.model || anthropicBody.model || "");
-    const chatToResponses = createOpenAIChatToResponsesSSETranslator(reqBody.model || "", reqBody);
+    const translator = createAnthropicToResponsesSSETranslator(reqBody.model || anthropicBody.model || "", reqBody);
 
     res.writeHead(200, {
       "content-type": "text/event-stream",
@@ -143,46 +138,24 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
 
     const parser = createSSEParser();
 
-    function pipeChatSSEToResponses(chatSSEStr) {
-      if (!chatSSEStr) return "";
-      // chatSSEStr may contain multiple "data: ...\n\n" blocks; split and feed
-      // each JSON payload (skip [DONE], which has no object form).
-      const out = [];
-      const blocks = chatSSEStr.split("\n\n");
-      for (const b of blocks) {
-        const line = b.trim();
-        if (!line.startsWith("data: ")) continue;
-        const d = line.slice(6).trim();
-        if (!d || d === "[DONE]") continue;
-        try {
-          const chunkObj = JSON.parse(d);
-          const sse = chatToResponses.translate(chunkObj);
-          if (sse) out.push(sse);
-        } catch {}
-      }
-      return out.join("");
-    }
-
     upstreamBody.on("data", chunk => {
       if (typeof ctx.markTTFT === "function") ctx.markTTFT();
       const outs = [];
       parser.feed(chunk, line => {
-        const chatSSE = anthToChat.translate(line.toString("utf8"));
-        const respSSE = pipeChatSSEToResponses(chatSSE);
-        if (respSSE) outs.push(respSSE);
+        const sse = translator.translate(line.toString("utf8"));
+        if (sse) outs.push(sse);
       });
       if (outs.length > 0) res.write(outs.join(""));
     });
     upstreamBody.on("end", () => {
       parser.flush(line => {
-        const chatSSE = anthToChat.translate(line.toString("utf8"));
-        const respSSE = pipeChatSSEToResponses(chatSSE);
-        if (respSSE) res.write(respSSE);
+        const sse = translator.translate(line.toString("utf8"));
+        if (sse) res.write(sse);
       });
-      const tail = chatToResponses.finalize();
+      const tail = translator.finalize();
       if (tail) res.write(tail);
       res.end();
-      const acc = anthToChat.getAcc();
+      const acc = translator.getUsage();
       if (acc.input_tokens || acc.output_tokens) {
         ctx.attachUsage(acc, {
           model: reqBody.model || anthropicBody.model || "",
@@ -199,7 +172,7 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
       // by Anthropic in `message_start`, which often arrives before the
       // stream breaks. Losing them silently makes post-mortem diagnosis
       // harder and distorts dashboard totals.
-      const acc = anthToChat.getAcc();
+      const acc = translator.getUsage();
       if (acc && (acc.input_tokens || acc.output_tokens)) {
         ctx.attachUsage(acc, {
           model: reqBody.model || anthropicBody.model || "",
@@ -207,7 +180,7 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
           duration_ms: Date.now() - ctx._start,
         });
       }
-      const tail = chatToResponses.finalize(err);
+      const tail = translator.finalize(err);
       if (tail) {
         try { res.write(tail); } catch {}
       }
@@ -216,7 +189,7 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
     return;
   }
 
-  // Non-streaming Anthropic → Chat → Responses.
+  // Non-streaming Anthropic → Responses.
   const chunks = [];
   let len = 0;
   upstreamBody.on("data", c => { chunks.push(c); len += c.length; });
@@ -234,8 +207,7 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
         stream: 0,
         duration_ms: Date.now() - ctx._start,
       });
-      const chatResp = anthropicResponseToOpenAIChat(anthropicResp);
-      const responsesResp = openaiChatResponseToResponses(chatResp, reqBody);
+      const responsesResp = anthropicResponseToResponses(anthropicResp, reqBody);
       json(res, statusCode || 200, responsesResp, req);
     } catch (convErr) {
       convertOk = false;
