@@ -52,7 +52,7 @@ function injectStreamOptions(obj) {
  * Responses → OpenAI Chat (forward) → OpenAI Chat response → Responses.
  */
 async function proxyResponsesAsOpenAI(req, res, ctx, backend, reqBody) {
-  const chatBody = responsesBodyToOpenAIChat(reqBody);
+  const chatBody = responsesBodyToOpenAIChat(reqBody, backend);
   injectStreamOptions(chatBody);
   const chatBuf = Buffer.from(JSON.stringify(chatBody));
   if (typeof ctx.attachBody === "function") ctx.attachBody(chatBuf);
@@ -76,7 +76,7 @@ async function proxyResponsesAsOpenAI(req, res, ctx, backend, reqBody) {
   if (statusCode >= 400) {
     return relayUpstreamErrorBody({
       statusCode, upstreamBody, ctx, backend, res, req, finish,
-      format: "openai", label: "Responses→OpenAI-Chat",
+      format: "responses", label: "Responses→OpenAI-Chat",
     });
   }
 
@@ -122,7 +122,7 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
   if (statusCode >= 400) {
     return relayUpstreamErrorBody({
       statusCode, upstreamBody, ctx, backend, res, req, finish,
-      format: "openai", label: "Responses→Anthropic",
+      format: "responses", label: "Responses→Anthropic",
     });
   }
 
@@ -184,6 +184,10 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
       if (tail) {
         try { res.write(tail); } catch {}
       }
+      // End the SSE stream now that the failure event was written; this lets
+      // sendUpstreamError see `res.writableEnded === true` and skip emitting
+      // a duplicate `response.failed` event.
+      try { res.end(); } catch {}
       sendUpstreamError({ err, ctx, backend, res, req, finish });
     });
     return;
@@ -286,7 +290,14 @@ function streamChatToResponses(res, req, ctx, backend, reqBody, upstreamBody, fi
   upstreamBody.on("error", err => {
     try {
       const tail = translator.finalize(err);
-      if (tail) res.write(tail);
+      if (tail) {
+        res.write(tail);
+        // We just wrote a `response.failed` SSE event; close the stream so
+        // sendUpstreamError observes `res.writableEnded` and doesn't emit a
+        // second `response.failed` (which would surface as a duplicate event
+        // with `sequence_number:-1` to the client).
+        try { res.end(); } catch {}
+      }
     } catch {}
     sendUpstreamError({ err, ctx, backend, res, req, finish });
   });

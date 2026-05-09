@@ -245,3 +245,81 @@ describe("handlers - proxyOpenAIChat conversion failures", () => {
     }
   });
 });
+
+describe("handlers - proxyOpenAIChat streaming termination", () => {
+  function loadHandlersWithMockUpstream(upstreamBody, statusCode = 200) {
+    const backendPath = require.resolve("./backend");
+    const handlersPath = require.resolve("./handlers");
+    delete require.cache[handlersPath];
+    const backend = require("./backend");
+    const origDoUpstream = backend.doUpstream;
+    backend.doUpstream = async () => ({
+      statusCode,
+      headers: { "content-type": "text/event-stream" },
+      body: upstreamBody,
+      finish: () => {},
+      abort: () => {},
+    });
+    const handlers = require("./handlers");
+    return {
+      handlers,
+      restore() {
+        backend.doUpstream = origDoUpstream;
+        delete require.cache[handlersPath];
+        delete require.cache[backendPath];
+      },
+    };
+  }
+
+  function makeFakeRes() {
+    const res = new EventEmitter();
+    res.headersSent = false;
+    res._chunks = [];
+    res._ended = false;
+    res.writeHead = () => { res.headersSent = true; };
+    res.write = (c) => { res._chunks.push(String(c)); return true; };
+    res.end = (c) => { if (c) res._chunks.push(String(c)); res._ended = true; };
+    res.destroy = () => { res._ended = true; };
+    res.getHeader = () => "text/event-stream";
+    return res;
+  }
+  function makeCtx() {
+    return {
+      rid: "test", _start: Date.now(),
+      on() {}, end() {}, err() {}, mute() {}, attachUsage() {}, attachBody() {},
+      markUpstream() {}, markTTFT() {}, flushOnClose() {},
+    };
+  }
+
+  it("Anthropic-format SSE never emits a literal `data: [DONE]` terminator", async () => {
+    const upstream = new EventEmitter();
+    const { handlers, restore } = loadHandlersWithMockUpstream(upstream, 200);
+    try {
+      const req = { headers: {}, method: "POST" };
+      const res = makeFakeRes();
+      const ctx = makeCtx();
+      const backendCfg = { provider: "P", baseUrl: "http://127/v1", apiKey: "k", type: "openai" };
+      const body = { model: "m", stream: true, messages: [{ role: "user", content: "hi" }] };
+      const p = handlers.proxyOpenAIChat(req, res, ctx, backendCfg, body);
+      await new Promise(r => setImmediate(r));
+
+      upstream.emit("data", Buffer.from(
+        'data: {"id":"c","choices":[{"delta":{"content":"hi"}}]}\n\n' +
+        'data: {"id":"c","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n' +
+        'data: [DONE]\n\n'
+      ));
+      upstream.emit("end");
+      await p;
+
+      const out = res._chunks.join("");
+      // The Anthropic SSE wire never includes `data: [DONE]`; `message_stop`
+      // is the canonical terminator. We must not emit OpenAI-style [DONE] to
+      // strict Anthropic clients.
+      assert.doesNotMatch(out, /data:\s*\[DONE\]/);
+      assert.match(out, /"type":"message_stop"/);
+      assert.ok(res._ended);
+    } finally {
+      restore();
+    }
+  });
+});

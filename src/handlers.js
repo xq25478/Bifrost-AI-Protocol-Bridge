@@ -221,7 +221,9 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
         if (d === "[DONE]") {
           const tail = translator.finalize();
           if (tail) outs.push(tail);
-          outs.push("data: [DONE]\n\n");
+          // Anthropic SSE has no `data: [DONE]` terminator — `message_stop`
+          // (emitted by translator.finalize()) is the canonical end. Strict
+          // Anthropic clients (anthropic-sdk-js) raise on unknown payloads.
           doneSent = true;
           return;
         }
@@ -237,7 +239,8 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
       if (!doneSent) {
         const tail = translator.finalize();
         if (tail) res.write(tail);
-        res.write("data: [DONE]\n\n");
+        // No `data: [DONE]` here either — see comment above for why
+        // Anthropic SSE clients should only ever see `message_stop`.
       }
       res.end();
       const finalUsage = translator.getUsage();
@@ -363,6 +366,11 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
         const converted = translator.translate(line.toString("utf8"));
         if (converted) res.write(converted);
       });
+      // If the upstream stream ended without a `message_stop` event, the
+      // translator never emitted `data: [DONE]` and the downstream client
+      // would hang. finalize() is a no-op when `[DONE]` was already sent.
+      const tail = translator.finalize();
+      if (tail) res.write(tail);
       res.end();
       const acc = translator.getAcc();
       if (acc.input_tokens || acc.output_tokens) {

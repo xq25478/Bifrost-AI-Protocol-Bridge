@@ -232,12 +232,18 @@ function responsesBodyToAnthropic(body) {
           break;
         }
         for (const call of calls) content.push(makeToolUse(call));
-        messages.push({ role: "assistant", content: content.length ? content : [{ type: "text", text: "" }] });
+        // Drop fully-empty assistant turns rather than synthesize a
+        // `[{type:"text", text:""}]` block — Anthropic rejects empty content.
+        if (content.length === 0) { i = j; continue; }
+        messages.push({ role: "assistant", content });
         emitToolResults(calls);
         i = j; continue;
       }
 
       const blocks = responsesContentToAnthropicBlocks(it.content);
+      // Skip empty user items: Anthropic rejects messages with no content
+      // ("messages: text content blocks must contain non-empty text").
+      if (blocks.length === 0) { i += 1; continue; }
       messages.push({ role: "user", content: blocksToAnthropicContent(blocks) });
       i += 1; continue;
     }

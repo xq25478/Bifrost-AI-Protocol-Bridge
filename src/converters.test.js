@@ -235,6 +235,18 @@ describe("openaiChatResponseToAnthropic", () => {
     assert.strictEqual(result.content[1].text, "42");
   });
 
+  it("maps Chat message.refusal to Anthropic refusal text and stop_reason", () => {
+    const result = openaiChatResponseToAnthropic({
+      choices: [{
+        message: { role: "assistant", content: null, refusal: "I cannot help with that." },
+        finish_reason: "stop",
+      }],
+    });
+    assert.strictEqual(result.stop_reason, "refusal");
+    assert.strictEqual(result.content[0].type, "text");
+    assert.strictEqual(result.content[0].text, "I cannot help with that.");
+  });
+
   it("omits thinking block when reasoning_content is null or empty", () => {
     for (const rc of [null, "", undefined]) {
       const res = {
@@ -378,6 +390,15 @@ describe("createOpenAIToAnthropicSSETranslator", () => {
     assert.ok(out.includes("content_block_stop"));
     assert.ok(out.includes("message_stop"));
   });
+
+  it("streams Chat refusal deltas as Anthropic text with refusal stop_reason", () => {
+    const t = createOpenAIToAnthropicSSETranslator("msg_1", "gpt-4");
+    const out = t.translate({ choices: [{ delta: { refusal: "No." }, finish_reason: null }] }) +
+      t.translate({ choices: [{ delta: {}, finish_reason: "stop" }] });
+    assert.ok(out.includes('"text_delta"'));
+    assert.ok(out.includes('"text":"No."'));
+    assert.ok(out.includes('"stop_reason":"refusal"'));
+  });
 });
 
 describe("openaiBodyToAnthropic", () => {
@@ -391,6 +412,15 @@ describe("openaiBodyToAnthropic", () => {
     assert.strictEqual(result.model, "gpt-4");
     assert.strictEqual(result.messages[0].role, "user");
     assert.strictEqual(result.messages[0].content, "Hi");
+  });
+
+  it("accepts Chat max_completion_tokens when converting to Anthropic max_tokens", () => {
+    const result = openaiBodyToAnthropic({
+      model: "gpt-4.1",
+      max_completion_tokens: 321,
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    assert.strictEqual(result.max_tokens, 321);
   });
 
   it("converts system message to top-level system", () => {
@@ -790,6 +820,15 @@ describe("createAnthropicToOpenAISSETranslator", () => {
     assert.ok(out.includes('"finish_reason":"length"'));
   });
 
+  it("maps model_context_window_exceeded stop_reason to length", () => {
+    const t = createAnthropicToOpenAISSETranslator("chat_1", "claude");
+    t.translate('data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}');
+    const out = t.translate(
+      'data: {"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded"},"usage":{"output_tokens":3}}'
+    );
+    assert.ok(out.includes('"finish_reason":"length"'));
+  });
+
   it("emits [DONE] on message_stop", () => {
     const t = createAnthropicToOpenAISSETranslator("chat_1", "claude");
     const out = t.translate('data: {"type":"message_stop"}');
@@ -977,7 +1016,7 @@ describe("anthropicBodyToOpenAIChat - thinking block handling", () => {
     assert.strictEqual(t.content, "ab");
   });
 
-  it("preserves tool_result image blocks as structured array", () => {
+  it("downgrades tool_result image blocks to text for Chat tool messages", () => {
     const body = {
       model: "m", max_tokens: 10,
       messages: [{ role: "user", content: [
@@ -989,10 +1028,7 @@ describe("anthropicBodyToOpenAIChat - thinking block handling", () => {
     };
     const out = anthropicBodyToOpenAIChat(body);
     const t = out.messages.find(m => m.role === "tool");
-    assert.ok(Array.isArray(t.content));
-    assert.strictEqual(t.content[0].type, "text");
-    assert.strictEqual(t.content[1].type, "image_url");
-    assert.strictEqual(t.content[1].image_url.url, "https://e.co/i.png");
+    assert.strictEqual(t.content, "see[image: https://e.co/i.png]");
   });
 
   it("maps Anthropic disable_parallel_tool_use to Chat parallel_tool_calls:false", () => {
@@ -1112,6 +1148,13 @@ describe("stop_reason / finish_reason mapping", () => {
     assert.strictEqual(r.choices[0].finish_reason, "content_filter");
   });
 
+  it("Anthropic model_context_window_exceeded → Chat length", () => {
+    const r = anthropicResponseToOpenAIChat({
+      content: [{ type: "text", text: "truncated" }], stop_reason: "model_context_window_exceeded"
+    });
+    assert.strictEqual(r.choices[0].finish_reason, "length");
+  });
+
   it("Chat content_filter → Anthropic refusal", () => {
     const r = openaiChatResponseToAnthropic({
       choices: [{ finish_reason: "content_filter", message: { role: "assistant", content: "" } }]
@@ -1152,5 +1195,74 @@ describe("createAnthropicToOpenAISSETranslator - tool index remap", () => {
     }
     // First tool_use got index 0, second got 1 — NOT 2/3 from content-block indexes.
     assert.deepStrictEqual(Array.from(new Set(indexes)).sort(), [0, 1]);
+  });
+});
+
+// ============================================================
+// Empty-content drop guard tests
+// ============================================================
+
+describe("empty-content guard (Chat ↔ Anthropic)", () => {
+  it("openaiBodyToAnthropic drops user messages with content:''", () => {
+    const out = openaiBodyToAnthropic({
+      model: "m",
+      messages: [
+        { role: "user", content: "" },
+        { role: "user", content: "real" },
+      ],
+    });
+    assert.deepStrictEqual(out.messages, [{ role: "user", content: "real" }]);
+  });
+
+  it("openaiBodyToAnthropic drops user messages with content:[] after flatten", () => {
+    const out = openaiBodyToAnthropic({
+      model: "m",
+      messages: [
+        { role: "user", content: [] },
+        { role: "user", content: "hi" },
+      ],
+    });
+    assert.deepStrictEqual(out.messages, [{ role: "user", content: "hi" }]);
+  });
+
+  it("openaiBodyToAnthropic drops fully-empty assistant messages (no text/reasoning/tool_calls)", () => {
+    const out = openaiBodyToAnthropic({
+      model: "m",
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "" },
+        { role: "user", content: "again" },
+      ],
+    });
+    assert.deepStrictEqual(out.messages, [
+      { role: "user", content: "hi" },
+      { role: "user", content: "again" },
+    ]);
+  });
+
+  it("anthropicBodyToOpenAIChat drops user messages whose content string is empty", () => {
+    const out = anthropicBodyToOpenAIChat({
+      model: "m",
+      messages: [
+        { role: "user", content: "" },
+        { role: "user", content: "hi" },
+      ],
+    });
+    assert.deepStrictEqual(out.messages.map(m => ({ role: m.role, content: m.content })), [
+      { role: "user", content: "hi" },
+    ]);
+  });
+
+  it("anthropicBodyToOpenAIChat drops user messages with content array that flattens to empty", () => {
+    const out = anthropicBodyToOpenAIChat({
+      model: "m",
+      messages: [
+        { role: "user", content: [] },
+        { role: "user", content: "real" },
+      ],
+    });
+    assert.deepStrictEqual(out.messages.map(m => ({ role: m.role, content: m.content })), [
+      { role: "user", content: "real" },
+    ]);
   });
 });

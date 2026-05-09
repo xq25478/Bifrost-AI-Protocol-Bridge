@@ -10,11 +10,10 @@ const { budgetToEffort, effortToBudget } = require("./thinking");
 
 /**
  * Flatten an Anthropic `tool_result.content` value into Chat's `role:"tool"`
- * content shape. Anthropic accepts string | [{type:"text"}|{type:"image"}];
- * Chat traditionally accepts a plain string, but newer OpenAI SDKs tolerate
- * an array of content parts. Strategy: if every block is text, concatenate to
- * string (lossless + friendliest to old servers); else emit an array so the
- * image parts survive.
+ * content shape. Anthropic accepts string | [{type:"text"}|{type:"image"}],
+ * but OpenAI Chat tool messages only accept text content. Keep text lossless
+ * and downgrade images to explicit breadcrumbs instead of sending `image_url`
+ * parts that official Chat backends reject for tool messages.
  */
 function toolResultContentToChat(raw) {
   if (raw == null) return "";
@@ -22,31 +21,24 @@ function toolResultContentToChat(raw) {
   if (!Array.isArray(raw)) {
     try { return JSON.stringify(raw); } catch { return String(raw); }
   }
-  const parts = [];
-  let onlyText = true;
+  const pieces = [];
   for (const b of raw) {
     if (b == null) continue;
-    if (typeof b === "string") { parts.push({ type: "text", text: b }); continue; }
-    if (b.type === "text" && typeof b.text === "string") { parts.push({ type: "text", text: b.text }); continue; }
+    if (typeof b === "string") { pieces.push(b); continue; }
+    if (b.type === "text" && typeof b.text === "string") { pieces.push(b.text); continue; }
     if (b.type === "image") {
-      onlyText = false;
       const src = b.source || {};
-      if (src.type === "base64" && src.data) {
-        parts.push({ type: "image_url", image_url: { url: `data:${src.media_type || "image/png"};base64,${src.data}` } });
-        continue;
-      }
       if (src.type === "url" && src.url) {
-        parts.push({ type: "image_url", image_url: { url: src.url } });
+        pieces.push(`[image: ${src.url}]`);
         continue;
       }
-      parts.push({ type: "text", text: "[image omitted]" });
+      const mediaType = src.media_type ? ` ${src.media_type}` : "";
+      pieces.push(`[image omitted${mediaType}]`);
       continue;
     }
-    try { parts.push({ type: "text", text: JSON.stringify(b) }); } catch {}
+    try { pieces.push(JSON.stringify(b)); } catch {}
   }
-  if (parts.length === 0) return "";
-  if (onlyText) return parts.map(p => p.text).join("");
-  return parts;
+  return pieces.join("");
 }
 
 function anthropicBodyToOpenAIChat(body, backend) {
@@ -58,11 +50,16 @@ function anthropicBodyToOpenAIChat(body, backend) {
   }
   for (const msg of body.messages || []) {
     if (typeof msg.content === "string") {
+      // Drop empty user/assistant turns rather than forwarding `content:""`,
+      // which OpenAI Chat backends reject for user messages.
+      if (msg.content.length === 0) continue;
       messages.push({ role: msg.role, content: msg.content });
       continue;
     }
     if (!Array.isArray(msg.content)) {
-      messages.push({ role: msg.role, content: "" });
+      // Anthropic schema only allows string | array on `content`; an exotic
+      // value here is malformed input. Skip rather than synthesize an empty
+      // message that the downstream backend will 400 on.
       continue;
     }
     const toolResults = [];
@@ -131,7 +128,12 @@ function anthropicBodyToOpenAIChat(body, backend) {
             parts.push(c.text || JSON.stringify(c));
           }
         }
-        if (parts.length === 0) { messages.push({ role: msg.role, content: "" }); continue; }
+        // Drop user/assistant messages whose content evaporated. OpenAI Chat
+        // (and downstream validators) reject `content:""` on user messages,
+        // and forwarding one would force the upstream to 400 the entire
+        // conversation. The original turn carried no renderable signal —
+        // skipping it is the lossless equivalent.
+        if (parts.length === 0) { continue; }
         if (parts.every(p => typeof p === "string")) {
           messages.push({ role: msg.role, content: parts.join("") });
         } else {
@@ -240,6 +242,12 @@ function openaiChatResponseToAnthropic(openaiRes) {
   }
   // OpenAI allows content=null when tool_calls present; keep at least empty text
   if (typeof msg.content === "string") content.push({ type: "text", text: msg.content });
+  else if (Array.isArray(msg.content)) {
+    for (const b of chatContentToAnthropicBlocks(msg.content)) content.push(b);
+  }
+  if (typeof msg.refusal === "string" && msg.refusal.length > 0) {
+    content.push({ type: "text", text: msg.refusal });
+  }
   if (Array.isArray(msg.tool_calls)) {
     for (const tc of msg.tool_calls) {
       let input = {};
@@ -261,7 +269,8 @@ function openaiChatResponseToAnthropic(openaiRes) {
   // would break a strict Anthropic client.
   const fr = choice?.finish_reason;
   let stopReason = "end_turn";
-  if (fr === "stop") stopReason = "end_turn";
+  if (typeof msg.refusal === "string" && msg.refusal.length > 0) stopReason = "refusal";
+  else if (fr === "stop") stopReason = "end_turn";
   else if (fr === "length") stopReason = "max_tokens";
   else if (fr === "tool_calls" || fr === "function_call") stopReason = "tool_use";
   else if (fr === "content_filter") stopReason = "refusal";
@@ -291,6 +300,7 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
   let thinkingIndex = -1;
   let textOpen = false;
   let textIndex = -1;
+  let sawRefusal = false;
   const toolBlocks = new Map();
   let nextIndex = 0;
   let usage = null;
@@ -364,6 +374,7 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
   }
 
   function mapStopReason(fr) {
+    if (sawRefusal) return "refusal";
     if (fr === "stop") return "end_turn";
     if (fr === "length") return "max_tokens";
     if (fr === "tool_calls" || fr === "function_call") return "tool_use";
@@ -391,6 +402,7 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
 
       const hasToolCalls = Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0;
       const hasText = typeof delta.content === "string" && delta.content.length > 0;
+      const hasRefusal = typeof delta.refusal === "string" && delta.refusal.length > 0;
       const hasReasoning = typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0;
 
       // Reasoning streams before content; thinking block must close before
@@ -402,7 +414,7 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
           delta: { type: "thinking_delta", thinking: delta.reasoning_content }
         })}\n\n`);
       }
-      if ((hasText || hasToolCalls) && thinkingOpen) parts.push(closeThinking());
+      if ((hasText || hasRefusal || hasToolCalls) && thinkingOpen) parts.push(closeThinking());
 
       // Close text block BEFORE opening tool blocks when both appear in same chunk
       if (hasToolCalls && textOpen) parts.push(closeText());
@@ -412,6 +424,15 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
         parts.push(`data: ${JSON.stringify({
           type: "content_block_delta", index: textIndex,
           delta: { type: "text_delta", text: delta.content }
+        })}\n\n`);
+      }
+
+      if (hasRefusal) {
+        sawRefusal = true;
+        if (!textOpen) parts.push(openText());
+        parts.push(`data: ${JSON.stringify({
+          type: "content_block_delta", index: textIndex,
+          delta: { type: "text_delta", text: delta.refusal }
         })}\n\n`);
       }
 
@@ -514,6 +535,7 @@ function extractMessageText(content) {
     if (!p) continue;
     if (typeof p === "string") { out.push(p); continue; }
     if (typeof p.text === "string") { out.push(p.text); continue; }
+    if (typeof p.refusal === "string") { out.push(p.refusal); continue; }
     if (p.type === "image_url") { out.push("[image omitted]"); continue; }
     try { out.push(JSON.stringify(p)); } catch {}
   }
@@ -574,6 +596,7 @@ function chatContentToAnthropicBlocks(raw) {
     if (part == null) continue;
     if (typeof part === "string") { if (part) out.push({ type: "text", text: part }); continue; }
     if (part.type === "text") { if (part.text) out.push({ type: "text", text: part.text }); continue; }
+    if (part.type === "refusal") { if (part.refusal) out.push({ type: "text", text: part.refusal }); continue; }
     if (part.type === "image_url") {
       const url = part.image_url?.url || "";
       if (url.startsWith("data:")) {
@@ -632,7 +655,12 @@ function openaiBodyToAnthropic(body) {
           content.push({ type: "tool_use", id: tc.id, name: tc.function?.name || "", input });
         }
       }
-      if (content.length === 0) content.push({ type: "text", text: "" });
+      // Anthropic rejects assistant turns whose content is empty (or carries
+      // a `[{type:"text", text:""}]` block). When neither text, reasoning,
+      // nor tool_calls survived the conversion (e.g. a Chat message that
+      // was nothing but `content:""`), drop the turn rather than synthesize
+      // an empty text block that Bedrock will 400 on.
+      if (content.length === 0) { i += 1; continue; }
       messages.push({ role: "assistant", content });
       i += 1; continue;
     }
@@ -653,11 +681,20 @@ function openaiBodyToAnthropic(body) {
     }
 
     // Regular user / (assistant that somehow reached here with no tool_calls).
+    // Anthropic rejects user / assistant messages with empty `content`
+    // (string=="" or content==[]) — Bedrock returns 400 ("messages: text
+    // content blocks must contain non-empty text"). Drop empties so we never
+    // forward a malformed turn that the upstream would reject for the whole
+    // batch.
     if (typeof msg.content === "string") {
-      messages.push({ role: toAnthropicRole(msg.role), content: msg.content });
+      if (msg.content.length > 0) {
+        messages.push({ role: toAnthropicRole(msg.role), content: msg.content });
+      }
     } else if (Array.isArray(msg.content)) {
       const content = chatContentToAnthropicBlocks(msg.content);
-      messages.push({ role: toAnthropicRole(msg.role), content });
+      if (content.length > 0) {
+        messages.push({ role: toAnthropicRole(msg.role), content });
+      }
     } else {
       const t = extractMessageText(msg.content);
       if (t) messages.push({ role: toAnthropicRole(msg.role), content: t });
@@ -665,7 +702,12 @@ function openaiBodyToAnthropic(body) {
     i += 1;
   }
 
-  const req = { model: body.model, messages, max_tokens: body.max_tokens || 4096 };
+  const maxTokens = typeof body.max_completion_tokens === "number"
+    ? body.max_completion_tokens
+    : typeof body.max_tokens === "number"
+      ? body.max_tokens
+      : 4096;
+  const req = { model: body.model, messages, max_tokens: maxTokens };
   if (systemParts.length > 0) req.system = systemParts.join("\n\n");
   if (body.stream !== undefined) req.stream = body.stream;
   if (body.temperature !== undefined) req.temperature = body.temperature;
@@ -852,7 +894,7 @@ function anthropicResponseToOpenAIChat(anthropicRes) {
     if (toolParts.length > 0) return "tool_calls";
     const sr = anthropicRes.stop_reason;
     if (sr === "end_turn" || sr === "stop" || sr === "stop_sequence" || sr === "pause_turn") return "stop";
-    if (sr === "max_tokens") return "length";
+    if (sr === "max_tokens" || sr === "model_context_window_exceeded") return "length";
     if (sr === "tool_use") return "tool_calls";
     if (sr === "refusal" || sr === "content_filter") return "content_filter";
     return "stop";
@@ -896,11 +938,16 @@ function createAnthropicToOpenAISSETranslator(chatId, model) {
   // tool index so parallel tool calls round-trip with the correct shape.
   const toolIndexByAnthIdx = new Map();
   let nextToolIndex = 0;
+  let doneEmitted = false;
 
   function translate(line) {
     if (!line.startsWith("data: ")) return "";
     const payload = line.slice(6).trim();
-    if (payload === "[DONE]") return "data: [DONE]\n\n";
+    if (payload === "[DONE]") {
+      if (doneEmitted) return "";
+      doneEmitted = true;
+      return "data: [DONE]\n\n";
+    }
 
     let evt;
     try { evt = JSON.parse(payload); } catch { return ""; }
@@ -971,7 +1018,7 @@ function createAnthropicToOpenAISSETranslator(chatId, model) {
         const sr = d.stop_reason;
         if (sr === "end_turn" || sr === "stop" || sr === "stop_sequence" || sr === "pause_turn") finishReason = "stop";
         else if (sr === "tool_use") finishReason = "tool_calls";
-        else if (sr === "max_tokens") finishReason = "length";
+        else if (sr === "max_tokens" || sr === "model_context_window_exceeded") finishReason = "length";
         else if (sr === "refusal" || sr === "content_filter") finishReason = "content_filter";
         else finishReason = "stop";
       }
@@ -989,6 +1036,8 @@ function createAnthropicToOpenAISSETranslator(chatId, model) {
     }
 
     if (evt.type === "message_stop") {
+      if (doneEmitted) return "";
+      doneEmitted = true;
       return "data: [DONE]\n\n";
     }
 
@@ -1002,6 +1051,8 @@ function createAnthropicToOpenAISSETranslator(chatId, model) {
    * instead of a hung connection.
    */
   function finalize(err) {
+    if (doneEmitted) return "";
+    doneEmitted = true;
     const now = Math.floor(Date.now() / 1000);
     const anthUsage = {
       input_tokens: acc.input_tokens,
