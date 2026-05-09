@@ -195,15 +195,43 @@ function normalizeConfig(parsed) {
   }
   if (errors.length) return { arr: null, errors };
 
+  // Route-level backend alias resolution: a route.backend can reference
+  // another route's name (e.g. "codex-all"). This lets you redirect a set
+  // of client model names by changing one entry rather than N.
+  //
+  // Example:
+  //   { "name": "codex-all",   "backend": "DeepSeek-V4-Flash-FP8" }
+  //   { "name": "gpt-5.4",     "backend": "codex-all" }  // resolves to DeepSeek-V4-Flash-FP8
+  //
+  // Cycles are guarded by a max chain depth equal to the route count.
+  function resolveAlias(key, seen) {
+    if (byModel.has(key)) return key;
+    if (seen.has(key)) return key; // cycle
+    seen.add(key);
+    for (const r of routes) {
+      if (r && typeof r.name === "string" && r.name.trim() === key) {
+        const bk = typeof r.backend === "string" ? r.backend.trim() : "";
+        if (bk && bk !== key) return resolveAlias(bk, seen);
+        break;
+      }
+    }
+    return key;
+  }
+
   for (const r of routes) {
     if (!r || typeof r !== "object") {
       errors.push(`invalid route entry: ${JSON.stringify(r)}`);
       continue;
     }
     const name = typeof r.name === "string" ? r.name.trim() : "";
-    const backendKey = typeof r.backend === "string" ? r.backend.trim() : "";
+    let backendKey = typeof r.backend === "string" ? r.backend.trim() : "";
     if (!name) { errors.push(`route missing .name: ${JSON.stringify(r)}`); continue; }
     if (!backendKey) { errors.push(`route "${name}" missing .backend`); continue; }
+    // Resolve one level of alias before looking up byModel.
+    if (!byModel.has(backendKey)) {
+      const resolved = resolveAlias(backendKey, new Set());
+      if (resolved !== backendKey) backendKey = resolved;
+    }
     const target = byModel.get(backendKey);
     if (!target) { errors.push(`route "${name}" references unknown backend model "${backendKey}"`); continue; }
     target.models.push({ id: name, upstream: target._upstreamModel });
