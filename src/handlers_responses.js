@@ -31,17 +31,14 @@ const { normalizeThinking } = require("./thinking");
 const { json, corsHeaders } = require("./http_utils");
 const { normalizeUsage } = require("./usage_recorder");
 const { createSSEParser, isSSEDataLine, sseDataPayload } = require("./sse");
+const {
+  _relayUpstreamErrorBody: relayUpstreamErrorBody,
+  _sendUpstreamError: rawSendUpstreamError,
+  _attachClientDisconnect: attachClientDisconnect,
+} = require("./handlers");
 
 function sendUpstreamError({ err, ctx, backend, res, req, finish }) {
-  if (finish) {
-    finish();
-    onBackendError(backend);
-  }
-  incMetric("upstream_errors");
-  const status = upstreamErrStatus(err);
-  ctx.err(status, err, { backend: backend.provider });
-  if (res.headersSent) { res.destroy(); return; }
-  json(res, status, { error: { message: String(err), type: "upstream_error", code: status } }, req);
+  rawSendUpstreamError({ err, ctx, backend, res, req, finish, format: "responses" });
 }
 
 function injectStreamOptions(obj) {
@@ -74,10 +71,17 @@ async function proxyResponsesAsOpenAI(req, res, ctx, backend, reqBody) {
   } catch (err) {
     return sendUpstreamError({ err, ctx, backend, res, req });
   }
-  const { statusCode, body: upstreamBody, finish } = up;
+  const { statusCode, body: upstreamBody, finish, abort } = up;
+
+  if (statusCode >= 400) {
+    return relayUpstreamErrorBody({
+      statusCode, upstreamBody, ctx, backend, res, req, finish,
+      format: "openai", label: "Responses→OpenAI-Chat",
+    });
+  }
 
   if (reqBody.stream) {
-    return streamChatToResponses(res, req, ctx, backend, reqBody, upstreamBody, finish, statusCode);
+    return streamChatToResponses(res, req, ctx, backend, reqBody, upstreamBody, finish, statusCode, abort);
   }
   return bufferChatToResponses(res, req, ctx, backend, reqBody, upstreamBody, finish, statusCode);
 }
@@ -114,7 +118,14 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
   } catch (err) {
     return sendUpstreamError({ err, ctx, backend, res, req });
   }
-  const { statusCode, body: upstreamBody, finish } = up;
+  const { statusCode, body: upstreamBody, finish, abort } = up;
+
+  if (statusCode >= 400) {
+    return relayUpstreamErrorBody({
+      statusCode, upstreamBody, ctx, backend, res, req, finish,
+      format: "openai", label: "Responses→Anthropic",
+    });
+  }
 
   if (anthropicBody.stream) {
     // Compose two SSE translators: Anthropic SSE -> Chat SSE -> Responses SSE.
@@ -128,9 +139,7 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
       "cache-control": "no-cache",
       ...corsHeaders(req),
     });
-    res.on("close", () => {
-      if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
-    });
+    attachClientDisconnect(res, ctx, abort);
 
     const parser = createSSEParser();
 
@@ -186,10 +195,19 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
       finish();
     });
     upstreamBody.on("error", err => {
-      const tail = chatToResponses.finalize(err);
-      if (tail && !res.headersSent) {
-        // unreachable: headers already sent by writeHead above, so just destroy
+      // Persist partial usage before we error out: input_tokens are reported
+      // by Anthropic in `message_start`, which often arrives before the
+      // stream breaks. Losing them silently makes post-mortem diagnosis
+      // harder and distorts dashboard totals.
+      const acc = anthToChat.getAcc();
+      if (acc && (acc.input_tokens || acc.output_tokens)) {
+        ctx.attachUsage(acc, {
+          model: reqBody.model || anthropicBody.model || "",
+          stream: 1,
+          duration_ms: Date.now() - ctx._start,
+        });
       }
+      const tail = chatToResponses.finalize(err);
       if (tail) {
         try { res.write(tail); } catch {}
       }
@@ -203,8 +221,14 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
   let len = 0;
   upstreamBody.on("data", c => { chunks.push(c); len += c.length; });
   upstreamBody.on("end", () => {
+    const rawBody = Buffer.concat(chunks, len).toString("utf8");
+    if (statusCode >= 400 && process.env.DEBUG_UPSTREAM_BODY === "1") {
+      const { system } = require("./logger");
+      system("warn", `upstream ${statusCode} body (Responses→Anthropic): ${rawBody.slice(0, 2000)}`, { backend: backend.provider, rid: ctx.rid });
+    }
+    let convertOk = true;
     try {
-      const anthropicResp = JSON.parse(Buffer.concat(chunks, len).toString("utf8"));
+      const anthropicResp = JSON.parse(rawBody);
       ctx.attachUsage(normalizeUsage(anthropicResp.usage), {
         model: anthropicResp.model || anthropicBody.model || reqBody.model || "",
         stream: 0,
@@ -213,11 +237,17 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
       const chatResp = anthropicResponseToOpenAIChat(anthropicResp);
       const responsesResp = openaiChatResponseToResponses(chatResp, reqBody);
       json(res, statusCode || 200, responsesResp, req);
-    } catch {
+    } catch (convErr) {
+      convertOk = false;
       json(res, 502, { error: { message: "Failed to convert Anthropic response to Responses format", type: "upstream_error" } }, req);
+      onBackendError(backend);
+      incMetric("upstream_errors");
+      ctx.err(502, convErr, { backend: backend.provider });
     }
-    onBackendSuccess(backend);
-    ctx.end(statusCode || 200, { backend: backend.provider });
+    if (convertOk) {
+      onBackendSuccess(backend);
+      ctx.end(statusCode || 200, { backend: backend.provider });
+    }
     finish();
   });
   upstreamBody.on("error", err => {
@@ -229,15 +259,13 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
 // Shared Chat-response handlers for proxyResponsesAsOpenAI
 // ------------------------------------------------------------
 
-function streamChatToResponses(res, req, ctx, backend, reqBody, upstreamBody, finish, statusCode) {
+function streamChatToResponses(res, req, ctx, backend, reqBody, upstreamBody, finish, statusCode, abort) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
     ...corsHeaders(req),
   });
-  res.on("close", () => {
-    if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
-  });
+  attachClientDisconnect(res, ctx, abort);
 
   const translator = createOpenAIChatToResponsesSSETranslator(reqBody.model || "", reqBody);
   const parser = createSSEParser();
@@ -297,6 +325,7 @@ function bufferChatToResponses(res, req, ctx, backend, reqBody, upstreamBody, fi
   let len = 0;
   upstreamBody.on("data", c => { chunks.push(c); len += c.length; });
   upstreamBody.on("end", () => {
+    let convertOk = true;
     try {
       const chatResp = JSON.parse(Buffer.concat(chunks, len).toString("utf8"));
       ctx.attachUsage(normalizeUsage(chatResp.usage), {
@@ -306,11 +335,17 @@ function bufferChatToResponses(res, req, ctx, backend, reqBody, upstreamBody, fi
       });
       const responsesResp = openaiChatResponseToResponses(chatResp, reqBody);
       json(res, statusCode || 200, responsesResp, req);
-    } catch {
+    } catch (convErr) {
+      convertOk = false;
       json(res, 502, { error: { message: "Failed to convert OpenAI response to Responses format", type: "upstream_error" } }, req);
+      onBackendError(backend);
+      incMetric("upstream_errors");
+      ctx.err(502, convErr, { backend: backend.provider });
     }
-    onBackendSuccess(backend);
-    ctx.end(statusCode || 200, { backend: backend.provider });
+    if (convertOk) {
+      onBackendSuccess(backend);
+      ctx.end(statusCode || 200, { backend: backend.provider });
+    }
     finish();
   });
   upstreamBody.on("error", err => {

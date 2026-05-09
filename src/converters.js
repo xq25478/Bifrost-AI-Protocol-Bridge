@@ -391,13 +391,72 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
 // OpenAI -> Anthropic Request
 // ============================================================
 
+/**
+ * Anthropic's Messages API (and Bedrock's pass-through validation) requires
+ * every tool's `input_schema` to be a JSON Schema object with `type: "object"`
+ * and a `properties` map. Clients built for OpenAI frequently send `{}` or a
+ * schema missing `type`, which Bedrock rejects with a 400
+ * (`input_schema.type: Field required`). Normalize here so any Chat-shaped
+ * tool list survives the conversion.
+ */
+function normalizeToolInputSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return { type: "object", properties: {} };
+  }
+  const out = { ...schema };
+  if (out.type !== "object") out.type = "object";
+  if (!out.properties || typeof out.properties !== "object" || Array.isArray(out.properties)) {
+    out.properties = {};
+  }
+  return out;
+}
+
+/**
+ * Anthropic's Messages API only accepts `user` or `assistant` on
+ * `messages[].role`. Any other Chat-side role that survived the system /
+ * tool_calls / tool branches above (e.g. an unknown `developer` left over
+ * from a bad conversion, or `function`) must be coerced before send, or
+ * Bedrock will reject the whole batch.
+ */
+function toAnthropicRole(role) {
+  return role === "assistant" ? "assistant" : "user";
+}
+
+/**
+ * Pull readable text out of a Chat `content` value, regardless of whether it
+ * came in as a plain string, an array of Chat content parts (`{type:"text"}`
+ * / `{type:"image_url"}` / ...), or something stranger. Used when flattening a
+ * system / developer message into Anthropic's top-level `system` string.
+ */
+function extractMessageText(content) {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) {
+    try { return JSON.stringify(content); } catch { return String(content); }
+  }
+  const out = [];
+  for (const p of content) {
+    if (!p) continue;
+    if (typeof p === "string") { out.push(p); continue; }
+    if (typeof p.text === "string") { out.push(p.text); continue; }
+    if (p.type === "image_url") { out.push("[image omitted]"); continue; }
+    try { out.push(JSON.stringify(p)); } catch {}
+  }
+  return out.join("");
+}
+
 function openaiBodyToAnthropic(body) {
   const messages = [];
-  let system = undefined;
+  // Anthropic accepts a single top-level `system` string; when the upstream
+  // Chat body carries multiple system messages (e.g. Responses `instructions`
+  // + a `developer` role message), concatenate rather than overwrite so no
+  // directive is silently dropped.
+  const systemParts = [];
 
   for (const msg of body.messages || []) {
-    if (msg.role === "system") {
-      system = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+    if (msg.role === "system" || msg.role === "developer") {
+      const txt = extractMessageText(msg.content);
+      if (txt) systemParts.push(txt);
       continue;
     }
     if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
@@ -417,7 +476,7 @@ function openaiBodyToAnthropic(body) {
       continue;
     }
     if (typeof msg.content === "string") {
-      messages.push({ role: msg.role, content: msg.content });
+      messages.push({ role: toAnthropicRole(msg.role), content: msg.content });
     } else if (Array.isArray(msg.content)) {
       const content = msg.content.map(part => {
         if (part.type === "text") return { type: "text", text: part.text };
@@ -431,12 +490,12 @@ function openaiBodyToAnthropic(body) {
         }
         return { type: "text", text: JSON.stringify(part) };
       });
-      messages.push({ role: msg.role, content });
+      messages.push({ role: toAnthropicRole(msg.role), content });
     }
   }
 
   const req = { model: body.model, messages, max_tokens: body.max_tokens || 4096 };
-  if (system !== undefined) req.system = system;
+  if (systemParts.length > 0) req.system = systemParts.join("\n\n");
   if (body.stream !== undefined) req.stream = body.stream;
   if (body.temperature !== undefined) req.temperature = body.temperature;
   if (body.top_p !== undefined) req.top_p = body.top_p;
@@ -445,13 +504,19 @@ function openaiBodyToAnthropic(body) {
     req.tools = body.tools.map(t => ({
       name: t.function?.name || t.name || "",
       description: t.function?.description || t.description || "",
-      input_schema: t.function?.parameters || t.parameters || { type: "object", properties: {} }
+      input_schema: normalizeToolInputSchema(t.function?.parameters ?? t.parameters)
     }));
   }
   if (body.tool_choice) {
     if (body.tool_choice === "auto") req.tool_choice = { type: "auto" };
     else if (body.tool_choice === "required") req.tool_choice = { type: "any" };
-    else if (body.tool_choice === "none") req.tool_choice = { type: "none" };
+    else if (body.tool_choice === "none") {
+      // Anthropic Messages API does not accept tool_choice:{type:"none"} —
+      // the closest semantic is "don't let the model call tools", which we
+      // express by stripping the tools array entirely. tool_choice is left
+      // unset so Anthropic defaults to auto with no tools available.
+      delete req.tools;
+    }
     else if (typeof body.tool_choice === "object") req.tool_choice = { type: "tool", name: body.tool_choice.function?.name || "" };
   }
   return req;
@@ -467,9 +532,14 @@ function anthropicResponseToOpenAIChat(anthropicRes) {
   const thinkingParts = content.filter(b => b.type === "thinking").map(b => b.thinking || b.text || "");
   const toolParts = content.filter(b => b.type === "tool_use");
 
-  const allText = textParts.join("") + (thinkingParts.length > 0 ? "\n[Thinking]\n" + thinkingParts.join("\n") : "");
-
-  const message = { role: "assistant", content: allText };
+  // Surface thinking as a dedicated `reasoning_content` field (matches the
+  // vLLM / SGLang / DeepSeek / GLM reasoner convention). Keep it OUT of the
+  // main `content` string so downstream Responses-format translation doesn't
+  // bake "[Thinking]" noise into `output_text`.
+  const message = { role: "assistant", content: textParts.join("") };
+  if (thinkingParts.length > 0) {
+    message.reasoning_content = thinkingParts.join("");
+  }
   if (toolParts.length > 0) {
     message.tool_calls = toolParts.map((tc, i) => ({
       id: tc.id || `call_${i}`,
@@ -558,6 +628,16 @@ function createAnthropicToOpenAISSETranslator(chatId, model) {
           choices: [{ index: 0, delta: { content: delta.text }, finish_reason: null }]
         })}\n\n`;
       }
+      // Anthropic emits `thinking_delta` inside a thinking content_block.
+      // Expose it to downstream Chat consumers as `reasoning_content`, which
+      // is the de-facto field used by vLLM / SGLang / DeepSeek / GLM reasoner
+      // streams and the same field our non-streaming converter now emits.
+      if (delta.type === "thinking_delta" && delta.thinking) {
+        return `data: ${JSON.stringify({
+          id: chatId, object: "chat.completion.chunk", created: now, model,
+          choices: [{ index: 0, delta: { reasoning_content: delta.thinking }, finish_reason: null }]
+        })}\n\n`;
+      }
       if (delta.type === "input_json_delta" && delta.partial_json) {
         return `data: ${JSON.stringify({
           id: chatId, object: "chat.completion.chunk", created: now, model,
@@ -598,7 +678,32 @@ function createAnthropicToOpenAISSETranslator(chatId, model) {
     return "";
   }
 
-  return { translate, getAcc() { return acc; } };
+  /**
+   * Emit a terminal chunk when the upstream stream errored BEFORE a natural
+   * message_delta/stop. Callers use this from their `upstreamBody.on("error")`
+   * handler so the downstream Chat client sees a proper finish_reason + DONE
+   * instead of a hung connection.
+   */
+  function finalize(err) {
+    const now = Math.floor(Date.now() / 1000);
+    const anthUsage = {
+      input_tokens: acc.input_tokens,
+      output_tokens: acc.output_tokens,
+    };
+    if (acc.cache_read_tokens > 0) anthUsage.cache_read_input_tokens = acc.cache_read_tokens;
+    if (acc.cache_write_tokens > 0) anthUsage.cache_creation_input_tokens = acc.cache_write_tokens;
+    const finishReason = err ? "error" : "stop";
+    const parts = [];
+    parts.push(`data: ${JSON.stringify({
+      id: chatId, object: "chat.completion.chunk", created: now, model,
+      choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+      usage: anthropicUsageToOpenAIShape(anthUsage)
+    })}\n\n`);
+    parts.push("data: [DONE]\n\n");
+    return parts.join("");
+  }
+
+  return { translate, getAcc() { return acc; }, finalize };
 }
 
 // ============================================================

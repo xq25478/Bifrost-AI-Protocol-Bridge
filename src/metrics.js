@@ -27,7 +27,10 @@ function metricPercentile(p) {
   if (latencyLen === 0) return 0;
   const arr = latencyRing.slice(0, latencyLen);
   arr.sort((a, b) => a - b);
-  return arr[Math.floor(latencyLen * p)] || 0;
+  // Nearest-rank method on a zero-indexed sorted array: clamp the rank to
+  // the last element so p=1.0 and small N do not read past the end.
+  const idx = Math.min(latencyLen - 1, Math.floor((latencyLen - 1) * p));
+  return arr[idx] || 0;
 }
 
 function metricsSnapshot() {

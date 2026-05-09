@@ -49,6 +49,22 @@ describe("metrics - recordLatency", () => {
     assert.strictEqual(m.latency_p95, 0);
     assert.strictEqual(m.latency_p99, 0);
   });
+
+  it("never reads past the last element (single sample)", () => {
+    recordLatency(42);
+    const m = metricsSnapshot();
+    assert.strictEqual(m.latency_p50, 42);
+    assert.strictEqual(m.latency_p95, 42);
+    assert.strictEqual(m.latency_p99, 42);
+  });
+
+  it("clamps the rank to N-1 for small N so p=1.0 is defined", () => {
+    recordLatency(10);
+    recordLatency(20);
+    const m = metricsSnapshot();
+    assert.ok(m.latency_p99 === 10 || m.latency_p99 === 20);
+    assert.ok(m.latency_p95 === 10 || m.latency_p95 === 20);
+  });
 });
 
 describe("metrics - token counters via incMetric", () => {

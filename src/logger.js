@@ -91,7 +91,13 @@ function writelog(entry) {
     }
 
     if (entry.backend) fragments.push(`backend=${entry.backend}`);
-    if (entry.model) fragments.push(`model=${entry.model}`);
+    if (entry.model) {
+      if (entry.upstream_model && entry.upstream_model !== entry.model) {
+        fragments.push(`model=${entry.model}${COLOR_DIM}→${LOG_RESET}${entry.upstream_model}`);
+      } else {
+        fragments.push(`model=${entry.model}`);
+      }
+    }
     if (entry.url) fragments.push(`${COLOR_DIM}url=${entry.url}${LOG_RESET}`);
 
     if (entry.err) fragments.push(`${color}err=${entry.err}${LOG_RESET}`);
@@ -136,6 +142,7 @@ function recordHttpOutcome(status, elapsed) {
 function requestlog(rid, method, path) {
   if (!rid) {
     const noop = {
+      rid: "",
       on() {}, end() {}, err() {}, mute() {}, attachUsage() {}, attachBody() {}, markUpstream() {}, markTTFT() {}, flushOnClose() {},
       _start: 0, _usage: null, _extra: null,
     };
@@ -152,6 +159,7 @@ function requestlog(rid, method, path) {
   let _upstreamMs = 0;
   let _ttftMs = 0;
   let _flushed = false;
+  let _routeInfo = null;
 
   const { recordRequestUsage } = require("./usage_recorder");
 
@@ -180,12 +188,18 @@ function requestlog(rid, method, path) {
   }
 
   const self = {
+    rid,
     _start: start,
     _usage: null,
     _extra: null,
     on(event, extra = {}) {
       if (muted) return;
-      const out = { ...base, event, elapsed: Date.now() - start, ...extra };
+      if (event === "route" && extra && typeof extra === "object") {
+        _routeInfo = {};
+        if (extra.model !== undefined) _routeInfo.model = extra.model;
+        if (extra.upstream_model !== undefined) _routeInfo.upstream_model = extra.upstream_model;
+      }
+      const out = { ...base, event, elapsed: Date.now() - start, ...(_routeInfo || {}), ...extra };
       if (_upstreamMs && out.upstream_ms === undefined) out.upstream_ms = _upstreamMs;
       writelog(out);
     },
@@ -222,7 +236,7 @@ function requestlog(rid, method, path) {
       const elapsed = Date.now() - start;
       const out = {
         ...base, event: "error", level: "error", status,
-        elapsed, err: err.message, ...extra
+        elapsed, err: err.message, ...(_routeInfo || {}), ...extra
       };
       if (_upstreamMs) out.upstream_ms = _upstreamMs;
       if (_bodySample) out.body_sample = _bodySample;

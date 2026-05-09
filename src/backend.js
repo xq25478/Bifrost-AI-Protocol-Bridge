@@ -126,7 +126,93 @@ async function doUpstream(url, options, backend, ctx) {
     }
   }
   if (ctx && typeof ctx.markUpstream === "function") ctx.markUpstream("end");
-  return { statusCode: r.statusCode, headers: r.headers, body: r.body, finish, signal: ac.signal };
+  const abort = (reason) => { try { ac.abort(reason); } catch {} };
+  return { statusCode: r.statusCode, headers: r.headers, body: r.body, finish, signal: ac.signal, abort };
+}
+
+/**
+ * Normalize parsed JSON into the internal array-of-backends shape that
+ * the rest of the loader expects. Accepts two input shapes:
+ *
+ *   1. Legacy flat array:  [{type, provider, baseUrl, models:[...]}, ...]
+ *      Returned as-is.
+ *
+ *   2. Recommended two-section shape:
+ *        {
+ *          "backends": [   // local upstream services — where + how to call them
+ *            { protocol, url, apiKey, model, thinking_format?, provider? }
+ *            // `model` is the upstream-accepted model name AND the
+ *            // identifier used by routes to reference this backend.
+ *          ],
+ *          "routes":   [   // gateway-exposed names → local backend
+ *            { name, backend }
+ *            // `backend` references a backends[].model value.
+ *          ]
+ *        }
+ *      Each route becomes a client-facing model id that forwards to its
+ *      backend's native `model` (the upstream-accepted model name).
+ *      Adding / removing exposed names is a one-line edit in `routes`.
+ *
+ * Returns { arr, errors }. On structural failure `arr` is null.
+ * Field-level validation (type/baseUrl/thinking_format/…) still runs
+ * downstream in validateBackends.
+ */
+function normalizeConfig(parsed) {
+  if (Array.isArray(parsed)) return { arr: parsed, errors: [] };
+  if (!parsed || typeof parsed !== "object") {
+    return { arr: null, errors: ["root must be an array or {backends, routes} object"] };
+  }
+  const { backends, routes } = parsed;
+  const errors = [];
+  if (!Array.isArray(backends)) errors.push("backends must be an array");
+  if (!Array.isArray(routes)) errors.push("routes must be an array");
+  if (errors.length) return { arr: null, errors };
+
+  const byModel = new Map();
+  for (const b of backends) {
+    if (!b || typeof b !== "object") {
+      errors.push(`invalid backend entry: ${JSON.stringify(b)}`);
+      continue;
+    }
+    const { protocol, url, apiKey, model, thinking_format, provider } = b;
+    if (typeof model !== "string" || !model.trim()) {
+      errors.push(`backend missing .model (upstream model name): ${JSON.stringify(b)}`);
+      continue;
+    }
+    if (byModel.has(model)) {
+      errors.push(`duplicate backend model: "${model}"`);
+      continue;
+    }
+    byModel.set(model, {
+      provider: provider || model,
+      type: protocol,
+      baseUrl: url,
+      apiKey,
+      thinking_format,
+      _upstreamModel: model,
+      models: [],
+    });
+  }
+  if (errors.length) return { arr: null, errors };
+
+  for (const r of routes) {
+    if (!r || typeof r !== "object") {
+      errors.push(`invalid route entry: ${JSON.stringify(r)}`);
+      continue;
+    }
+    const name = typeof r.name === "string" ? r.name.trim() : "";
+    const backendKey = typeof r.backend === "string" ? r.backend.trim() : "";
+    if (!name) { errors.push(`route missing .name: ${JSON.stringify(r)}`); continue; }
+    if (!backendKey) { errors.push(`route "${name}" missing .backend`); continue; }
+    const target = byModel.get(backendKey);
+    if (!target) { errors.push(`route "${name}" references unknown backend model "${backendKey}"`); continue; }
+    target.models.push({ id: name, upstream: target._upstreamModel });
+  }
+
+  for (const b of byModel.values()) delete b._upstreamModel;
+
+  if (errors.length) return { arr: null, errors };
+  return { arr: Array.from(byModel.values()), errors: [] };
 }
 
 /**
@@ -207,6 +293,12 @@ function loadBackends() {
     system("error", `backends.json is not valid JSON: ${err.message}`);
     return false;
   }
+  const norm = normalizeConfig(configs);
+  if (!norm.arr) {
+    system("error", `backends.json structure error:\n  - ${norm.errors.join("\n  - ")}`);
+    return false;
+  }
+  configs = norm.arr;
   const v = validateBackends(configs);
   if (!v.ok) {
     system("error", `backends.json validation failed:\n  - ${v.errors.join("\n  - ")}`);
@@ -259,22 +351,58 @@ let watchDebounce = null;
  */
 function watchBackends(onReload) {
   if (watchHandle) return watchHandle;
-  try {
-    watchHandle = fs.watch(BACKENDS_PATH, { persistent: false }, (eventType) => {
-      if (eventType !== "change" && eventType !== "rename") return;
-      if (watchDebounce) clearTimeout(watchDebounce);
-      watchDebounce = setTimeout(() => {
-        const ok = loadBackends();
-        if (typeof onReload === "function") {
-          try { onReload(ok); } catch {}
-        }
-      }, 250);
-    });
-    system("info", `watching ${BACKENDS_PATH} for changes`);
-  } catch (err) {
-    system("warn", `failed to watch ${BACKENDS_PATH}: ${err.message}`);
-    watchHandle = null;
+  let lastReloadCb = onReload;
+
+  function doReload() {
+    const ok = loadBackends();
+    if (typeof lastReloadCb === "function") {
+      try { lastReloadCb(ok); } catch {}
+    }
   }
+
+  function scheduleReload() {
+    if (watchDebounce) clearTimeout(watchDebounce);
+    watchDebounce = setTimeout(doReload, 250);
+  }
+
+  // Editors that save via atomic rename (vim, IntelliJ, etc.) replace the
+  // inode — the original fs.watch handle stops receiving events once the
+  // original file is unlinked. On "rename" we tear down the watcher and
+  // re-arm it against the new inode. A tiny retry loop covers the window
+  // between the rename and the replacement file appearing on disk.
+  function arm() {
+    try {
+      watchHandle = fs.watch(BACKENDS_PATH, { persistent: false }, (eventType) => {
+        if (eventType === "rename") {
+          scheduleReload();
+          try { watchHandle && watchHandle.close(); } catch {}
+          watchHandle = null;
+          // Re-arm after a short delay so the replacement file exists.
+          setTimeout(() => {
+            if (watchHandle) return;
+            try { arm(); }
+            catch (err) {
+              // Try once more after another short delay; some editors take
+              // a few tens of ms between unlink and create.
+              setTimeout(() => { try { arm(); } catch {} }, 250);
+              system("warn", `re-arm watch failed once: ${err.message}`);
+            }
+          }, 50);
+          return;
+        }
+        if (eventType === "change") {
+          scheduleReload();
+        }
+      });
+      system("info", `watching ${BACKENDS_PATH} for changes`);
+    } catch (err) {
+      system("warn", `failed to watch ${BACKENDS_PATH}: ${err.message}`);
+      watchHandle = null;
+      throw err;
+    }
+  }
+
+  try { arm(); } catch { /* already logged */ }
   return watchHandle;
 }
 
@@ -315,6 +443,7 @@ module.exports = {
   availableModelsStr: () => availableModelsStr,
   loadBackends,
   validateBackends,
+  normalizeConfig,
   watchBackends,
   stopWatchBackends,
   doUpstream,

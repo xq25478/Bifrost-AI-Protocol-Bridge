@@ -33,11 +33,97 @@ function sendUpstreamError({ err, ctx, backend, res, req, finish, format }) {
   incMetric("upstream_errors");
   const status = upstreamErrStatus(err);
   ctx.err(status, err, { backend: backend.provider });
-  if (res.headersSent) { res.destroy(); return; }
+  if (res.headersSent) {
+    // Headers already sent means we're mid-stream. Emit a protocol-appropriate
+    // error event + terminator so the client sees a clean end instead of a
+    // dangling socket half-close.
+    if (res.writableEnded) return;
+    const rawCT = (typeof res.getHeader === "function") ? res.getHeader("content-type") : "";
+    const contentType = String(rawCT || "").toLowerCase();
+    const isSSE = contentType.includes("text/event-stream");
+    if (isSSE) {
+      try {
+        if (format === "responses") {
+          const payload = JSON.stringify({
+            type: "response.failed",
+            sequence_number: -1,
+            response: { error: { message: String(err), type: "upstream_error", code: status } },
+          });
+          res.write(`event: response.failed\ndata: ${payload}\n\n`);
+        } else if (format === "anthropic") {
+          const payload = JSON.stringify({
+            type: "error",
+            error: { type: "upstream_error", message: String(err) },
+          });
+          res.write(`event: error\ndata: ${payload}\n\n`);
+        } else {
+          // OpenAI Chat SSE: no error event; emit a synthetic chunk + [DONE].
+          const payload = JSON.stringify({
+            error: { message: String(err), type: "upstream_error", code: status },
+          });
+          res.write(`data: ${payload}\n\n`);
+          res.write("data: [DONE]\n\n");
+        }
+        res.end();
+        return;
+      } catch {
+        try { res.destroy(); } catch {}
+        return;
+      }
+    }
+    try { res.destroy(); } catch {}
+    return;
+  }
   const body = format === "anthropic"
     ? { error: { message: String(err), type: "upstream_error", code: status } }
-    : { error: String(err) };
+    : format === "responses"
+      ? { error: { message: String(err), type: "upstream_error", code: status } }
+      : { error: String(err) };
   json(res, status, body, req);
+}
+
+/**
+ * When the upstream returns a 4xx/5xx status, the body is a structured error
+ * (JSON or plain text), not a stream of model output. Buffer it, log a
+ * truncated copy, and surface to the caller in the format they expect — so
+ * client-side error messages match the real upstream rejection (e.g.
+ * "tool_choice required without tools") instead of a silent empty stream or a
+ * generic 502.
+ *
+ * Handles both streaming and non-streaming entry points: the shared shape is
+ * "we have an open upstream body, status>=400, no headers sent yet". Returns
+ * true when it took ownership of the response, false otherwise.
+ */
+function relayUpstreamErrorBody({ statusCode, upstreamBody, ctx, backend, res, req, finish, format, label }) {
+  if (statusCode < 400) return false;
+  const chunks = [];
+  let len = 0;
+  upstreamBody.on("data", c => { chunks.push(c); len += c.length; });
+  upstreamBody.on("end", () => {
+    const rawBody = Buffer.concat(chunks, len).toString("utf8");
+    const { system } = require("./logger");
+    system("warn", `upstream ${statusCode} body (${label || "passthrough"}): ${rawBody.slice(0, 4000)}`,
+      { backend: backend.provider, rid: ctx.rid });
+    let parsed;
+    try { parsed = JSON.parse(rawBody); } catch {}
+    if (!res.headersSent) {
+      const body = format === "anthropic"
+        ? (parsed && parsed.error ? parsed : { error: { message: rawBody, type: "upstream_error", code: statusCode } })
+        : (parsed && parsed.error ? parsed : { error: { message: rawBody, type: "upstream_error", code: statusCode } });
+      json(res, statusCode, body, req);
+    } else {
+      // Headers already sent (e.g. SSE writeHead(200) raced ahead). Best we
+      // can do is destroy so the client sees a broken stream rather than a
+      // hung "completed" response.
+      try { res.destroy(); } catch {}
+    }
+    onBackendError(backend);
+    incMetric("upstream_errors");
+    ctx.end(statusCode, { backend: backend.provider });
+    if (finish) finish();
+  });
+  upstreamBody.on("error", err => sendUpstreamError({ err, ctx, backend, res, req, finish, format }));
+  return true;
 }
 
 function injectStreamOptions(bodyStr) {
@@ -49,6 +135,23 @@ function injectStreamOptions(bodyStr) {
     }
   } catch {}
   return bodyStr;
+}
+
+
+/**
+ * Wire a client-disconnect hook onto `res`. When the client closes the TCP
+ * connection before the upstream response has finished streaming, we abort
+ * the upstream request so the backend stops consuming bandwidth/quota. The
+ * abort signal surfaces through `upstreamBody.on("error")` → `sendUpstreamError`
+ * for normal bookkeeping.
+ */
+function attachClientDisconnect(res, ctx, abort) {
+  res.on("close", () => {
+    if (!res.writableEnded && typeof abort === "function") {
+      abort("client_disconnected");
+    }
+    if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
+  });
 }
 
 function ctxMeta(ctx, backend, model, stream, endpoint, clientFormat) {
@@ -83,10 +186,17 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
   try {
     up = await doUpstream(backendUrl, { method: "POST", headers, body: openaiBuf }, backend, ctx);
   } catch (err) {
-    return sendUpstreamError({ err, ctx, backend, res, req });
+    return sendUpstreamError({ err, ctx, backend, res, req, format: "anthropic" });
   }
 
-  const { statusCode, body: upstreamBody, finish } = up;
+  const { statusCode, body: upstreamBody, finish, abort } = up;
+
+  if (statusCode >= 400) {
+    return relayUpstreamErrorBody({
+      statusCode, upstreamBody, ctx, backend, res, req, finish,
+      format: "anthropic", label: "Anthropic→OpenAI-Chat",
+    });
+  }
 
   if (body.stream) {
     res.writeHead(200, {
@@ -94,9 +204,7 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
       "cache-control": "no-cache",
       ...corsHeaders(req),
     });
-    res.on("close", () => {
-      if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
-    });
+    attachClientDisconnect(res, ctx, abort);
     const msgId = "msg_" + crypto.randomUUID();
     const model = body.model || "";
     const translator = createOpenAIToAnthropicSSETranslator(msgId, model);
@@ -145,13 +253,25 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
       finish();
     });
     upstreamBody.on("error", err => {
-      sendUpstreamError({ err, ctx, backend, res, req, finish });
+      const partial = translator.getUsage && translator.getUsage();
+      if (partial) {
+        const n = normalizeUsage(partial);
+        if (n.input_tokens || n.output_tokens) {
+          ctx.attachUsage(n, {
+            model: body.model || "",
+            stream: 1,
+            duration_ms: Date.now() - ctx._start,
+          });
+        }
+      }
+      sendUpstreamError({ err, ctx, backend, res, req, finish, format: "anthropic" });
     });
   } else {
     const responseChunks = [];
     let responseLen = 0;
     upstreamBody.on("data", chunk => { responseChunks.push(chunk); responseLen += chunk.length; });
     upstreamBody.on("end", () => {
+      let convertOk = true;
       try {
         const openaiResp = JSON.parse(Buffer.concat(responseChunks, responseLen).toString("utf8"));
         const anthropicResp = openaiChatResponseToAnthropic(openaiResp);
@@ -161,15 +281,21 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
           duration_ms: Date.now() - ctx._start
         });
         json(res, statusCode || 200, anthropicResp, req);
-      } catch {
+      } catch (convErr) {
+        convertOk = false;
         json(res, 502, { error: "Failed to convert OpenAI response to Anthropic format" }, req);
+        onBackendError(backend);
+        incMetric("upstream_errors");
+        ctx.err(502, convErr, { backend: backend.provider });
       }
-      onBackendSuccess(backend);
-      ctx.end(statusCode || 200, { backend: backend.provider });
+      if (convertOk) {
+        onBackendSuccess(backend);
+        ctx.end(statusCode || 200, { backend: backend.provider });
+      }
       finish();
     });
     upstreamBody.on("error", err => {
-      sendUpstreamError({ err, ctx, backend, res, req, finish });
+      sendUpstreamError({ err, ctx, backend, res, req, finish, format: "anthropic" });
     });
   }
 }
@@ -198,10 +324,17 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
   try {
     up = await doUpstream(upstreamUrl, { method: "POST", headers, body: bodyBuf }, backend, ctx);
   } catch (err) {
-    return sendUpstreamError({ err, ctx, backend, res, req, format: "anthropic" });
+    return sendUpstreamError({ err, ctx, backend, res, req, format: "openai" });
   }
 
-  const { statusCode, body: upstreamBody, finish } = up;
+  const { statusCode, body: upstreamBody, finish, abort } = up;
+
+  if (statusCode >= 400) {
+    return relayUpstreamErrorBody({
+      statusCode, upstreamBody, ctx, backend, res, req, finish,
+      format: "openai", label: "OpenAI→Anthropic",
+    });
+  }
 
   if (anthropicBody.stream) {
     res.writeHead(200, {
@@ -209,9 +342,7 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
       "cache-control": "no-cache",
       ...corsHeaders(req),
     });
-    res.on("close", () => {
-      if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
-    });
+    attachClientDisconnect(res, ctx, abort);
     const chatId = "chatcmpl-" + crypto.randomUUID().replace(/-/g, "").slice(0, 24);
     const model = anthropicBody.model || "";
 
@@ -246,13 +377,22 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
       finish();
     });
     upstreamBody.on("error", err => {
-      sendUpstreamError({ err, ctx, backend, res, req, finish, format: "anthropic" });
+      const acc = translator.getAcc && translator.getAcc();
+      if (acc && (acc.input_tokens || acc.output_tokens)) {
+        ctx.attachUsage(acc, {
+          model: anthropicBody.model || "",
+          stream: 1,
+          duration_ms: Date.now() - ctx._start,
+        });
+      }
+      sendUpstreamError({ err, ctx, backend, res, req, finish, format: "openai" });
     });
   } else {
     const responseChunks = [];
     let responseLen = 0;
     upstreamBody.on("data", chunk => { responseChunks.push(chunk); responseLen += chunk.length; });
     upstreamBody.on("end", () => {
+      let convertOk = true;
       try {
         const anthropicResp = JSON.parse(Buffer.concat(responseChunks, responseLen).toString("utf8"));
         ctx.attachUsage(normalizeUsage(anthropicResp.usage), {
@@ -262,15 +402,21 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
         });
         const openaiResp = anthropicResponseToOpenAIChat(anthropicResp);
         json(res, statusCode || 200, openaiResp, req);
-      } catch {
+      } catch (convErr) {
+        convertOk = false;
         json(res, 502, { error: "Failed to convert Anthropic response to OpenAI format" }, req);
+        onBackendError(backend);
+        incMetric("upstream_errors");
+        ctx.err(502, convErr, { backend: backend.provider });
       }
-      onBackendSuccess(backend);
-      ctx.end(statusCode || 200, { backend: backend.provider });
+      if (convertOk) {
+        onBackendSuccess(backend);
+        ctx.end(statusCode || 200, { backend: backend.provider });
+      }
       finish();
     });
     upstreamBody.on("error", err => {
-      sendUpstreamError({ err, ctx, backend, res, req, finish, format: "anthropic" });
+      sendUpstreamError({ err, ctx, backend, res, req, finish, format: "openai" });
     });
   }
 }
@@ -293,20 +439,24 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
   try {
     up = await doUpstream(backendUrl, { method: "POST", headers, body: bodyBuf }, backend, ctx);
   } catch (err) {
-    return sendUpstreamError({ err, ctx, backend, res, req });
+    return sendUpstreamError({ err, ctx, backend, res, req, format: "openai" });
   }
 
   const isStream = parsedBody.stream === true;
-  const { statusCode, headers: resHeaders, body: upstreamBody, finish } = up;
+  const { statusCode, headers: resHeaders, body: upstreamBody, finish, abort } = up;
   const cleanHeaders = {};
   for (const [k, v] of Object.entries(resHeaders)) {
-    if (!HOP_BY_HOP.has(k.toLowerCase())) cleanHeaders[k] = v;
+    const lk = k.toLowerCase();
+    if (HOP_BY_HOP.has(lk)) continue;
+    // Upstream content-length is only valid when we forward the body byte-
+    // for-byte. We mutate streaming responses (line-buffered parsing,
+    // possible usage rewrite) and some buffered paths, so the advertised
+    // length can no longer be trusted — drop it and let Node chunk-encode.
+    if (lk === "content-length") continue;
+    cleanHeaders[k] = v;
   }
   res.writeHead(statusCode || 502, cleanHeaders);
-  res.on("close", () => {
-    finish();
-    if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
-  });
+  attachClientDisconnect(res, ctx, abort);
 
   if (isStream) {
     const parser = createSSEParser();
@@ -337,6 +487,10 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
     });
     upstreamBody.on("end", () => {
       parser.flush(line => { res.write(line.toString("utf8") + "\n"); });
+      // SSE requires the final event to terminate with a blank line. When
+      // upstream does not end on a trailing newline, append one so strict
+      // SSE parsers treat the stream as completed instead of pending.
+      res.write("\n");
       res.end();
       if (acc.input_tokens || acc.output_tokens) {
         ctx.attachUsage(acc, {
@@ -350,7 +504,14 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
       finish();
     });
     upstreamBody.on("error", err => {
-      sendUpstreamError({ err, ctx, backend, res, req, finish });
+      if (acc.input_tokens || acc.output_tokens) {
+        ctx.attachUsage(acc, {
+          model: parsedBody.model || "",
+          stream: 1,
+          duration_ms: Date.now() - ctx._start,
+        });
+      }
+      sendUpstreamError({ err, ctx, backend, res, req, finish, format: "openai" });
     });
   } else {
     const responseChunks = [];
@@ -375,7 +536,7 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
       finish();
     });
     upstreamBody.on("error", err => {
-      sendUpstreamError({ err, ctx, backend, res, req, finish });
+      sendUpstreamError({ err, ctx, backend, res, req, finish, format: "openai" });
     });
   }
 }
@@ -401,11 +562,24 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
     } catch {}
   }
 
+  // Only a tight allow-list of client headers survives into the upstream
+  // request. In particular, the client's Authorization / Cookie / User-Agent
+  // must NOT leak to the upstream provider — we inject the backend-specific
+  // x-api-key ourselves, and anything else would either confuse the upstream
+  // (dual credentials) or leak local identity to a third party.
+  const ANTH_PASSTHROUGH_HEADERS = new Set([
+    "accept",
+    "accept-encoding",
+    "anthropic-version",
+    "content-type",
+  ]);
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
     const lower = k.toLowerCase();
-    if (HOP_BY_HOP.has(lower) || lower === "anthropic-beta" || lower === "content-length") continue;
-    headers[k] = v;
+    if (ANTH_PASSTHROUGH_HEADERS.has(lower)) headers[k] = v;
+  }
+  if (!Object.keys(headers).some(k => k.toLowerCase() === "anthropic-version")) {
+    headers["anthropic-version"] = "2023-06-01";
   }
   headers.host = upstreamUrl.host;
   headers["x-api-key"] = resolveApiKey(req, backend.apiKey);
@@ -415,19 +589,23 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
   try {
     up = await doUpstream(upstreamUrl, { method: req.method, headers, body: bodyBuf }, backend, ctx);
   } catch (err) {
-    return sendUpstreamError({ err, ctx, backend, res, req });
+    return sendUpstreamError({ err, ctx, backend, res, req, format: "anthropic" });
   }
 
-  const { statusCode, headers: resHeaders, body: upstreamBody, finish } = up;
+  const { statusCode, headers: resHeaders, body: upstreamBody, finish, abort } = up;
   const cleanHeaders = {};
   for (const [k, v] of Object.entries(resHeaders)) {
-    if (!HOP_BY_HOP.has(k.toLowerCase())) cleanHeaders[k] = v;
+    const lk = k.toLowerCase();
+    if (HOP_BY_HOP.has(lk)) continue;
+    // Upstream content-length is only valid when we forward the body byte-
+    // for-byte. We mutate streaming responses (line-buffered parsing,
+    // possible usage rewrite) and some buffered paths, so the advertised
+    // length can no longer be trusted — drop it and let Node chunk-encode.
+    if (lk === "content-length") continue;
+    cleanHeaders[k] = v;
   }
   res.writeHead(statusCode || 502, cleanHeaders);
-  res.on("close", () => {
-    finish();
-    if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
-  });
+  attachClientDisconnect(res, ctx, abort);
 
   if (isStream) {
     const parser = createSSEParser();
@@ -444,6 +622,15 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
       if (outs.length > 0) res.write(outs.join(""));
     });
     upstreamBody.on("end", () => {
+      parser.flush(line => {
+        const s = line.toString("utf8");
+        parseAnthropicSSEUsage(s, acc);
+        res.write(s + "\n");
+      });
+      // SSE requires the final event to terminate with a blank line. When
+      // upstream does not end on a trailing newline, append one so strict
+      // SSE parsers treat the stream as completed instead of pending.
+      res.write("\n");
       res.end();
       if (acc.input_tokens || acc.output_tokens) {
         ctx.attachUsage(acc, {
@@ -457,7 +644,14 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
       finish();
     });
     upstreamBody.on("error", err => {
-      sendUpstreamError({ err, ctx, backend, res, req, finish });
+      if (acc.input_tokens || acc.output_tokens) {
+        ctx.attachUsage(acc, {
+          model: acc.model || backend.models?.[0] || "",
+          stream: 1,
+          duration_ms: Date.now() - ctx._start,
+        });
+      }
+      sendUpstreamError({ err, ctx, backend, res, req, finish, format: "anthropic" });
     });
   } else {
     const responseChunks = [];
@@ -482,7 +676,7 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
       finish();
     });
     upstreamBody.on("error", err => {
-      sendUpstreamError({ err, ctx, backend, res, req, finish });
+      sendUpstreamError({ err, ctx, backend, res, req, finish, format: "anthropic" });
     });
   }
 }
@@ -494,4 +688,8 @@ module.exports = {
   proxyRequest,
   // exposed for unit tests
   _injectStreamOptions: injectStreamOptions,
+  // exposed for other handler modules
+  _relayUpstreamErrorBody: relayUpstreamErrorBody,
+  _sendUpstreamError: sendUpstreamError,
+  _attachClientDisconnect: attachClientDisconnect,
 };

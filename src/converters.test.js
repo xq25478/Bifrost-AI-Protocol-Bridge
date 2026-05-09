@@ -441,6 +441,18 @@ describe("openaiBodyToAnthropic", () => {
     });
     assert.deepStrictEqual(resultAuto.tool_choice, { type: "auto" });
   });
+
+  it("strips tools when tool_choice is 'none' (Anthropic rejects type:'none')", () => {
+    const result = openaiBodyToAnthropic({
+      model: "x",
+      max_tokens: 100,
+      messages: [{ role: "user", content: "Hi" }],
+      tools: [{ type: "function", function: { name: "t", parameters: { type: "object", properties: {} } } }],
+      tool_choice: "none",
+    });
+    assert.strictEqual(result.tool_choice, undefined);
+    assert.strictEqual(result.tools, undefined);
+  });
 });
 
 describe("anthropicResponseToOpenAIChat", () => {
@@ -506,6 +518,24 @@ describe("anthropicResponseToOpenAIChat", () => {
     // Cache writes kept as extension field (no standard OpenAI equivalent)
     assert.strictEqual(result.usage.cache_creation_input_tokens, 20);
   });
+
+  it("thinking blocks surface as reasoning_content, NOT merged into content", () => {
+    const res = {
+      id: "msg_think",
+      model: "claude",
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Let me consider..." },
+        { type: "text", text: "The answer is 42." },
+      ],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 10, output_tokens: 5 }
+    };
+    const result = anthropicResponseToOpenAIChat(res);
+    assert.strictEqual(result.choices[0].message.content, "The answer is 42.");
+    assert.strictEqual(result.choices[0].message.reasoning_content, "Let me consider...");
+    assert.ok(!result.choices[0].message.content.includes("[Thinking]"));
+  });
 });
 
 describe("createAnthropicToOpenAISSETranslator", () => {
@@ -543,6 +573,25 @@ describe("createAnthropicToOpenAISSETranslator", () => {
       'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}'
     );
     assert.ok(out.includes('"content":"Hello"'));
+  });
+
+  it("emits reasoning_content delta for thinking_delta (not swallowed)", () => {
+    const t = createAnthropicToOpenAISSETranslator("chat_1", "claude");
+    const out = t.translate(
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"considering..."}}'
+    );
+    assert.ok(out.includes('"reasoning_content":"considering..."'),
+      `expected reasoning_content delta, got: ${out}`);
+    // Should NOT be mis-mapped onto content
+    assert.ok(!out.includes('"content":"considering..."'));
+  });
+
+  it("finalize(err) emits a terminal stop chunk and [DONE]", () => {
+    const t = createAnthropicToOpenAISSETranslator("chat_1", "claude");
+    t.translate('data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}');
+    const out = t.finalize(new Error("boom"));
+    assert.ok(out.includes('"finish_reason":"error"'));
+    assert.ok(out.endsWith("data: [DONE]\n\n"));
   });
 
   it("emits finish_reason on message_delta with full OpenAI usage shape", () => {
