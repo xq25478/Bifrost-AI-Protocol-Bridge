@@ -109,7 +109,7 @@ describe("handlers - Anthropic passthrough headers", () => {
     };
   }
 
-  it("forwards anthropic-beta while still stripping local credentials", async () => {
+  it("strips anthropic-beta to avoid Bedrock validation errors", async () => {
     const upstream = new EventEmitter();
     const { handlers, captured, restore } = loadHandlersCapturingUpstream(upstream);
     try {
@@ -136,7 +136,7 @@ describe("handlers - Anthropic passthrough headers", () => {
       await handlers.proxyRequest(req, res, ctx, backendCfg, "/anthropic/v1/messages", body);
       const call = captured();
       assert.ok(call, "expected doUpstream to be called");
-      assert.strictEqual(call.options.headers["anthropic-beta"], req.headers["anthropic-beta"]);
+      assert.strictEqual(call.options.headers["anthropic-beta"], undefined);
       assert.strictEqual(call.options.headers["anthropic-version"], "2023-06-01");
       assert.strictEqual(call.options.headers["x-api-key"], "sk-upstream");
       assert.strictEqual(call.options.headers.authorization, undefined);
