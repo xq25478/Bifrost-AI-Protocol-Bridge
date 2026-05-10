@@ -301,6 +301,9 @@ const server = http.createServer((req, res) => {
           "x-api-key": resolveApiKey(req, backend.apiKey),
           host: upstreamUrl.host,
         };
+        if (req.headers["anthropic-beta"]) {
+          upstreamHeaders["anthropic-beta"] = req.headers["anthropic-beta"];
+        }
 
         let up;
         try {

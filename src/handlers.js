@@ -607,6 +607,7 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
   const ANTH_PASSTHROUGH_HEADERS = new Set([
     "accept",
     "accept-encoding",
+    "anthropic-beta",
     "anthropic-version",
     "content-type",
   ]);

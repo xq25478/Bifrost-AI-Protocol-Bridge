@@ -38,6 +38,118 @@ describe("handlers - injectStreamOptions", () => {
   });
 });
 
+describe("handlers - Anthropic passthrough headers", () => {
+  function loadHandlersCapturingUpstream(upstreamBody, statusCode = 200) {
+    const backendPath = require.resolve("./backend");
+    const handlersPath = require.resolve("./handlers");
+    delete require.cache[handlersPath];
+    const backend = require("./backend");
+    const origDoUpstream = backend.doUpstream;
+    let captured = null;
+    backend.doUpstream = async (url, options, backendCfg, ctx) => {
+      captured = { url, options, backendCfg, ctx };
+      return {
+        statusCode,
+        headers: { "content-type": "application/json", connection: "close" },
+        body: upstreamBody,
+        finish: () => {},
+        abort: () => {},
+      };
+    };
+    const handlers = require("./handlers");
+    return {
+      handlers,
+      captured: () => captured,
+      restore() {
+        backend.doUpstream = origDoUpstream;
+        delete require.cache[handlersPath];
+        delete require.cache[backendPath];
+      },
+    };
+  }
+
+  function makeFakeRes() {
+    const res = new EventEmitter();
+    res.headersSent = false;
+    res._status = 0;
+    res._headers = {};
+    res._chunks = [];
+    res._ended = false;
+    res._endedPromise = new Promise(resolve => { res._resolveEnd = resolve; });
+    res.writeHead = (status, headers) => {
+      res.headersSent = true;
+      res._status = status;
+      res._headers = headers || {};
+    };
+    res.write = (chunk) => {
+      res._chunks.push(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk));
+      return true;
+    };
+    res.end = (chunk) => {
+      if (chunk) res.write(chunk);
+      res._ended = true;
+      res._resolveEnd();
+    };
+    res.destroy = () => {
+      res._ended = true;
+      res._resolveEnd();
+    };
+    return res;
+  }
+
+  function makeCtx() {
+    return {
+      rid: "test",
+      _start: Date.now(),
+      on() {}, end() {}, err() {}, mute() {}, attachUsage() {}, attachBody() {},
+      markUpstream() {}, markTTFT() {}, flushOnClose() {},
+    };
+  }
+
+  it("forwards anthropic-beta while still stripping local credentials", async () => {
+    const upstream = new EventEmitter();
+    const { handlers, captured, restore } = loadHandlersCapturingUpstream(upstream);
+    try {
+      const req = {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": "tool-search-2025-10-19,files-api-2025-04-14",
+          authorization: "Bearer local-client-token",
+          cookie: "sid=local",
+        },
+      };
+      const res = makeFakeRes();
+      const ctx = makeCtx();
+      const backendCfg = {
+        provider: "P",
+        baseUrl: "http://upstream.example/anthropic",
+        apiKey: "sk-upstream",
+        type: "anthropic",
+      };
+      const body = JSON.stringify({ model: "claude", max_tokens: 8, messages: [{ role: "user", content: "hi" }] });
+
+      await handlers.proxyRequest(req, res, ctx, backendCfg, "/anthropic/v1/messages", body);
+      const call = captured();
+      assert.ok(call, "expected doUpstream to be called");
+      assert.strictEqual(call.options.headers["anthropic-beta"], req.headers["anthropic-beta"]);
+      assert.strictEqual(call.options.headers["anthropic-version"], "2023-06-01");
+      assert.strictEqual(call.options.headers["x-api-key"], "sk-upstream");
+      assert.strictEqual(call.options.headers.authorization, undefined);
+      assert.strictEqual(call.options.headers.cookie, undefined);
+
+      upstream.emit("data", Buffer.from("{}"));
+      upstream.emit("end");
+      await res._endedPromise;
+      assert.strictEqual(res._status, 200);
+      assert.ok(res._ended);
+    } finally {
+      restore();
+    }
+  });
+});
+
 describe("handlers - proxyOpenAIDirect streaming SSE framing", () => {
   // Stub backend.doUpstream BEFORE handlers.js captures it via destructuring.
   // Tests reload handlers.js against a fresh require cache to pick up the stub.
