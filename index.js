@@ -301,7 +301,6 @@ const server = http.createServer((req, res) => {
           up = await doUpstream(upstreamUrl, { method: "POST", headers: upstreamHeaders, body: reqBodyBuf }, backend);
         } catch (err) {
           incMetric("upstream_errors");
-          onBackendError(backend);
           const status = upstreamErrStatus(err);
           ctx.err(status, err, { backend: backend.provider });
           if (res.headersSent) { res.destroy(); return; }
@@ -318,7 +317,6 @@ const server = http.createServer((req, res) => {
           try {
             parsedResp = JSON.parse(buf.toString("utf8"));
           } catch {
-            onBackendError(backend);
             ctx.err(502, new Error("invalid upstream response"), { backend: backend.provider });
             finish();
             if (res.headersSent) { res.destroy(); return; }
@@ -326,14 +324,12 @@ const server = http.createServer((req, res) => {
           }
           const inputTokens = typeof parsedResp.input_tokens === "number" ? parsedResp.input_tokens : 0;
           ctx.on("count_tokens", { backend: backend.provider, model: modelId, msg: `input_tokens=${inputTokens}` });
-          onBackendSuccess(backend);
           ctx.end(statusCode || 200, { backend: backend.provider });
           finish();
           return json(res, statusCode || 200, parsedResp, req);
         });
         upstreamBody.on("error", err => {
           finish();
-          onBackendError(backend);
           incMetric("upstream_errors");
           const status = upstreamErrStatus(err);
           ctx.err(status, err, { backend: backend.provider });

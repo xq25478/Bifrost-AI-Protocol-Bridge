@@ -47,17 +47,23 @@ describe("handlers - proxyOpenAIDirect streaming SSE framing", () => {
     delete require.cache[handlersPath];
     const backend = require("./backend");
     const origDoUpstream = backend.doUpstream;
+    const origOnSuccess = backend.onBackendSuccess;
+    const origOnError = backend.onBackendError;
     backend.doUpstream = async () => ({
       statusCode,
       headers: { "content-type": "text/event-stream" },
       body: upstreamBody,
       finish: () => {},
     });
+    backend.onBackendSuccess = () => {};
+    backend.onBackendError = () => {};
     const handlers = require("./handlers");
     return {
       handlers,
       restore() {
         backend.doUpstream = origDoUpstream;
+        backend.onBackendSuccess = origOnSuccess;
+        backend.onBackendError = origOnError;
         delete require.cache[handlersPath];
         delete require.cache[backendPath];
       },

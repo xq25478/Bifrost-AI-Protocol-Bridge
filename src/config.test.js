@@ -28,11 +28,6 @@ describe("config", () => {
     assert.ok(config.SUPPORTED_THINKING_EFFORTS.has("max"));
   });
 
-  it("defines circuit breaker config", () => {
-    assert.ok(config.CIRCUIT_THRESHOLD > 0);
-    assert.ok(config.CIRCUIT_OPEN_MS > 0);
-  });
-
   it("defines shutdown drain time", () => {
     assert.ok(config.SHUTDOWN_DRAIN_MS > 0);
   });

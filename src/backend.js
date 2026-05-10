@@ -24,19 +24,25 @@ function upstreamErrStatus(err) {
   return 502;
 }
 
-// Circuit breaker has been intentionally removed. Every request is forwarded
-// to the upstream and the upstream's real response (success or error) is
-// returned to the client verbatim. The hooks below are kept as no-ops so that
-// existing call sites in handlers / index.js continue to compile without
-// having to plumb conditional logic through every path.
-function circuitState(_backend) { return "closed"; }
-function isCircuitOpen(_backend) { return false; }
-function tryAcquireCircuit(_backend) { return true; }
-function onBackendError(_backend) {}
-function onBackendSuccess(_backend) {}
-
 function isTransientConnectError(err) {
   return !!(err && RETRYABLE_CODES.has(err.code));
+}
+
+/**
+ * Record a backend error for the dashboard / metrics counters. Called from
+ * every error path after an upstream attempt has already completed or thrown.
+ * Pure bookkeeping — does not implement any circuit-breaking logic.
+ */
+function onBackendError(backend) {
+  backend.consecutiveErrors = (backend.consecutiveErrors || 0) + 1;
+}
+
+/**
+ * Mark a backend attempt as successful so the dashboard reflects health.
+ * Resets the consecutive-error counter on the backend object.
+ */
+function onBackendSuccess(backend) {
+  if (backend.consecutiveErrors) backend.consecutiveErrors = 0;
 }
 
 /**
@@ -424,9 +430,6 @@ module.exports = {
   stopWatchBackends,
   doUpstream,
   upstreamErrStatus,
-  isCircuitOpen,
-  tryAcquireCircuit,
-  circuitState,
   onBackendError,
   onBackendSuccess,
   resolveApiKey,
