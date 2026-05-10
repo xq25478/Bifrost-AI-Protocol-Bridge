@@ -25,7 +25,7 @@ const {
   sanitizeAnthropicBody,
 } = require("./converters");
 const {
-  doUpstream, upstreamErrStatus, onBackendError, onBackendSuccess, resolveApiKey,
+  doUpstream, upstreamErrStatus, resolveApiKey,
 } = require("./backend");
 const { incMetric } = require("./metrics");
 const { normalizeThinking } = require("./thinking");
@@ -200,7 +200,6 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
           duration_ms: Date.now() - ctx._start,
         });
       }
-      onBackendSuccess(backend);
       ctx.end(statusCode || 200, { backend: backend.provider });
       finish();
     });
@@ -251,12 +250,10 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
     } catch (convErr) {
       convertOk = false;
       json(res, 502, { error: { message: "Failed to convert Anthropic response to Responses format", type: "upstream_error" } }, req);
-      onBackendError(backend);
       incMetric("upstream_errors");
       ctx.err(502, convErr, { backend: backend.provider });
     }
     if (convertOk) {
-      onBackendSuccess(backend);
       ctx.end(statusCode || 200, { backend: backend.provider });
     }
     finish();
@@ -320,7 +317,6 @@ function streamChatToResponses(res, req, ctx, backend, reqBody, upstreamBody, fi
         duration_ms: Date.now() - ctx._start,
       });
     }
-    onBackendSuccess(backend);
     ctx.end(statusCode || 200, { backend: backend.provider });
     finish();
   });
@@ -352,12 +348,10 @@ function bufferChatToResponses(res, req, ctx, backend, reqBody, upstreamBody, fi
     } catch (convErr) {
       convertOk = false;
       json(res, 502, { error: { message: "Failed to convert OpenAI response to Responses format", type: "upstream_error" } }, req);
-      onBackendError(backend);
       incMetric("upstream_errors");
       ctx.err(502, convErr, { backend: backend.provider });
     }
     if (convertOk) {
-      onBackendSuccess(backend);
       ctx.end(statusCode || 200, { backend: backend.provider });
     }
     finish();

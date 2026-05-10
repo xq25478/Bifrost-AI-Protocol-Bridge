@@ -81,7 +81,7 @@ In short: **your client code never changes. Switch models by changing one string
 - **Persistent storage**: SQLite (WAL mode, batched writes) with 365-day retention — survives restarts
 - **Accurate token capture**: Captures usage from all 8 client-backend path combinations (streaming and non-streaming, passthrough and converted) via the API response data
 - **Thinking adaptation**: Auto-normalize `thinking.enabled` to AWS Bedrock-compatible `adaptive`
-- **Tested**: 194 unit tests covering converters (Chat ↔ Anthropic, Responses ↔ Chat), thinking, metrics, token estimation, usage recording, SSE parsing, circuit breaker, startup banner, and persistent-store schema resilience
+- **Tested**: unit tests covering converters (Chat ↔ Anthropic, Responses ↔ Chat), thinking, metrics, token estimation, usage recording, SSE parsing, startup banner, and persistent-store schema resilience
 
 ## Quick Start
 
@@ -950,10 +950,10 @@ A: Open `https://127.0.0.1:8443/dashboard` in a browser (or `http://127.0.0.1:<P
 openproxyrouter/
 ├── index.js               # Main entry point — HTTP server + routing + /_dashboard
 ├── src/
-│   ├── config.js          # All constants (ports, timeouts, breaker, etc.)
+│   ├── config.js          # All constants (ports, timeouts, etc.)
 │   ├── logger.js          # Structured logger + ctx.attachUsage seam (TTY/JSON)
 │   ├── metrics.js         # In-memory metrics + P50/P95/P99 latency
-│   ├── backend.js         # Backend registry, upstream calls, circuit breaker
+│   ├── backend.js         # Backend registry and upstream calls
 │   ├── thinking.js        # Thinking configuration normalization
 │   ├── converters.js      # All 4 protocol converters + SSE translators + parseAnthropicSSEUsage
 │   ├── handlers.js        # All 4 proxy handlers with 8 capture points for token usage

@@ -85,7 +85,7 @@
 - **持久化存储**：SQLite（WAL 模式 + 批量写入）+ 365 天数据保留 — 重启不丢数据
 - **精确 Token 采集**：通过 API 响应数据捕获全部 8 个路径组合的用量（含流式/非流式、直传/转换），杜绝漏统
 - **Thinking 适配**：自动将 `thinking.enabled` 规范化为 AWS Bedrock 兼容的 `adaptive`
-- **测试覆盖**：194 个单元测试，涵盖转换器（Chat ↔ Anthropic、Responses ↔ Chat）、thinking、指标、token 估算、使用量记录、SSE 解析、熔断器、启动 Banner、以及持久化存储的 schema 容错
+- **测试覆盖**：单元测试涵盖转换器（Chat ↔ Anthropic、Responses ↔ Chat）、thinking、指标、token 估算、使用量记录、SSE 解析、启动 Banner、以及持久化存储的 schema 容错
 
 ## 快速开始
 
@@ -951,10 +951,10 @@ A：浏览器打开 `https://127.0.0.1:8443/dashboard`（或 `http://127.0.0.1:<
 openproxyrouter/
 ├── index.js               # 主入口 —— HTTP 服务器 + 路由分发 + /_dashboard
 ├── src/
-│   ├── config.js          # 全局常量（端口、超时、熔断器配置等）
+│   ├── config.js          # 全局常量（端口、超时等）
 │   ├── logger.js          # 结构化日志 + ctx.attachUsage 采集接缝（TTY/JSON）
 │   ├── metrics.js         # 内存指标 + P50/P95/P99 延迟
-│   ├── backend.js         # 后端注册表、上游调用、熔断器
+│   ├── backend.js         # 后端注册表、上游调用
 │   ├── thinking.js        # Thinking 配置归一化
 │   ├── converters.js      # 4 × 协议转换器 + SSE 流翻译器 + parseAnthropicSSEUsage
 │   ├── handlers.js        # 全部 4 个代理处理器 + 8 个 Token 捕获点

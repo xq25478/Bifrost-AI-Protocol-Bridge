@@ -169,9 +169,6 @@ describe("handlers - proxyOpenAIChat conversion failures", () => {
     delete require.cache[handlersPath];
     const backend = require("./backend");
     const origDoUpstream = backend.doUpstream;
-    const origOnSuccess = backend.onBackendSuccess;
-    const origOnError = backend.onBackendError;
-    const hits = { success: 0, error: 0 };
     backend.doUpstream = async () => ({
       statusCode,
       headers: { "content-type": "application/json" },
@@ -179,15 +176,11 @@ describe("handlers - proxyOpenAIChat conversion failures", () => {
       finish: () => {},
       abort: () => {},
     });
-    backend.onBackendSuccess = () => { hits.success += 1; };
-    backend.onBackendError = () => { hits.error += 1; };
     const handlers = require("./handlers");
     return {
-      handlers, hits,
+      handlers,
       restore() {
         backend.doUpstream = origDoUpstream;
-        backend.onBackendSuccess = origOnSuccess;
-        backend.onBackendError = origOnError;
         delete require.cache[handlersPath];
         delete require.cache[backendPath];
       },
@@ -222,9 +215,9 @@ describe("handlers - proxyOpenAIChat conversion failures", () => {
     };
   }
 
-  it("records backend error + ctx.err(502) when upstream body is not valid JSON", async () => {
+  it("records ctx.err(502) when upstream body is not valid JSON", async () => {
     const upstream = new EventEmitter();
-    const { handlers, hits, restore } = loadHandlersWithMockUpstream(upstream, 200);
+    const { handlers, restore } = loadHandlersWithMockUpstream(upstream, 200);
     try {
       const req = { headers: {}, method: "POST" };
       const res = makeFakeRes();
@@ -239,9 +232,6 @@ describe("handlers - proxyOpenAIChat conversion failures", () => {
 
       // Response must be 502 (conversion failure), not upstream's 200.
       assert.strictEqual(res._status, 502);
-      // Should have NOT called onBackendSuccess.
-      assert.strictEqual(hits.success, 0, "onBackendSuccess must not fire on convert failure");
-      assert.strictEqual(hits.error, 1, "onBackendError should fire exactly once");
       // ctx.err should have been invoked with 502.
       assert.deepStrictEqual(ctx._errs.map(e => e[0]), [502]);
       // ctx.end must not have been called with the upstream 200.

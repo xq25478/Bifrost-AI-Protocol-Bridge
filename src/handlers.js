@@ -12,7 +12,7 @@ const {
   sanitizeAnthropicBody,
 } = require("./converters");
 const {
-  doUpstream, upstreamErrStatus, onBackendError, onBackendSuccess, resolveApiKey,
+  doUpstream, upstreamErrStatus, resolveApiKey,
 } = require("./backend");
 const { incMetric } = require("./metrics");
 const { HOP_BY_HOP } = require("./config");
@@ -22,14 +22,12 @@ const { normalizeUsage } = require("./usage_recorder");
 const { createSSEParser, isSSEDataLine, sseDataPayload } = require("./sse");
 
 /**
- * Shared upstream-error handler. Used after `await doUpstream(...)` throws
- * (no `finish`/no onBackendError — doUpstream already called them), and from
- * `upstreamBody.on("error", ...)` where both are needed.
+ * Shared upstream-error handler. Used after `await doUpstream(...)` throws,
+ * and from `upstreamBody.on("error", ...)` where stream cleanup is needed.
  */
 function sendUpstreamError({ err, ctx, backend, res, req, finish, format }) {
   if (finish) {
     finish();
-    onBackendError(backend);
   }
   incMetric("upstream_errors");
   const status = upstreamErrStatus(err);
@@ -118,7 +116,6 @@ function relayUpstreamErrorBody({ statusCode, upstreamBody, ctx, backend, res, r
       // hung "completed" response.
       try { res.destroy(); } catch {}
     }
-    onBackendError(backend);
     incMetric("upstream_errors");
     ctx.end(statusCode, { backend: backend.provider });
     if (finish) finish();
@@ -318,7 +315,6 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
           duration_ms: Date.now() - ctx._start
         });
       }
-      onBackendSuccess(backend);
       ctx.end(200, { backend: backend.provider });
       finish();
     });
@@ -355,12 +351,10 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
       } catch (convErr) {
         convertOk = false;
         json(res, 502, { error: "Failed to convert OpenAI response to Anthropic format" }, req);
-        onBackendError(backend);
         incMetric("upstream_errors");
         ctx.err(502, convErr, { backend: backend.provider });
       }
       if (convertOk) {
-        onBackendSuccess(backend);
         ctx.end(statusCode || 200, { backend: backend.provider });
       }
       finish();
@@ -446,7 +440,6 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
           duration_ms: Date.now() - ctx._start
         });
       }
-      onBackendSuccess(backend);
       ctx.end(statusCode || 200, { backend: backend.provider });
       finish();
     });
@@ -480,12 +473,10 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
       } catch (convErr) {
         convertOk = false;
         json(res, 502, { error: "Failed to convert Anthropic response to OpenAI format" }, req);
-        onBackendError(backend);
         incMetric("upstream_errors");
         ctx.err(502, convErr, { backend: backend.provider });
       }
       if (convertOk) {
-        onBackendSuccess(backend);
         ctx.end(statusCode || 200, { backend: backend.provider });
       }
       finish();
@@ -576,7 +567,6 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
           duration_ms: Date.now() - ctx._start
         });
       }
-      onBackendSuccess(backend);
       ctx.end(statusCode || 502, { backend: backend.provider });
       finish();
     });
@@ -609,7 +599,6 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
         }
       } catch {}
       res.end(buf);
-      onBackendSuccess(backend);
       ctx.end(statusCode || 502, { backend: backend.provider });
       finish();
     });
@@ -731,7 +720,6 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
           duration_ms: Date.now() - ctx._start
         });
       }
-      onBackendSuccess(backend);
       ctx.end(statusCode || 502, { backend: backend.provider });
       finish();
     });
@@ -764,7 +752,6 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
         }
       } catch {}
       res.end(buf);
-      onBackendSuccess(backend);
       ctx.end(statusCode || 502, { backend: backend.provider });
       finish();
     });

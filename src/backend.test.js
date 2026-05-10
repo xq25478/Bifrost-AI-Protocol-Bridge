@@ -3,7 +3,7 @@
 const { describe, it, beforeEach } = require("node:test");
 const assert = require("node:assert/strict");
 
-const { backends, modelIndex, modelList, availableModelsStr, resolveApiKey, upstreamErrStatus, resetForTest } = require("./backend");
+const { backends, modelIndex, modelList, availableModelsStr, resolveApiKey, upstreamErrStatus, resetForTest, normalizeConfig } = require("./backend");
 
 function makeBackend(provider, type) {
   return { provider, type, index: 0, baseUrl: "https://api.example.com", apiKey: "sk-test", models: ["model-a"] };
@@ -160,5 +160,55 @@ describe("backend - validateBackends", () => {
     ]);
     assert.strictEqual(r.ok, false);
     assert.ok(r.errors.some(e => /strings or \{id, upstream\}/.test(e)), r.errors.join(", "));
+  });
+});
+
+describe("backend - normalizeConfig route alias resolution", () => {
+  it("resolves a route.backend that points to another route name", () => {
+    const { arr, errors } = normalizeConfig({
+      backends: [
+        { provider: "MaaS", protocol: "openai", url: "http://x/v1", apiKey: "k", model: "DeepSeek" },
+      ],
+      routes: [
+        { name: "codex-all", backend: "DeepSeek" },
+        { name: "gpt-5", backend: "codex-all" },
+        { name: "gpt-5-mini", backend: "codex-all" },
+      ],
+    });
+    assert.deepStrictEqual(errors, []);
+    assert.ok(Array.isArray(arr));
+    assert.strictEqual(arr.length, 1);
+    const ids = arr[0].models.map(m => m.id).sort();
+    assert.deepStrictEqual(ids, ["codex-all", "gpt-5", "gpt-5-mini"]);
+    for (const m of arr[0].models) assert.strictEqual(m.upstream, "DeepSeek");
+  });
+
+  it("still flags routes pointing at a truly unknown backend", () => {
+    const { arr, errors } = normalizeConfig({
+      backends: [
+        { provider: "MaaS", protocol: "openai", url: "http://x/v1", apiKey: "k", model: "DeepSeek" },
+      ],
+      routes: [
+        { name: "x", backend: "no-such-thing" },
+      ],
+    });
+    assert.strictEqual(arr, null);
+    assert.ok(errors.some(e => /unknown backend model "no-such-thing"/.test(e)), errors.join(", "));
+  });
+
+  it("breaks alias cycles instead of recursing forever", () => {
+    const { arr, errors } = normalizeConfig({
+      backends: [
+        { provider: "MaaS", protocol: "openai", url: "http://x/v1", apiKey: "k", model: "Real" },
+      ],
+      routes: [
+        { name: "a", backend: "b" },
+        { name: "b", backend: "a" },
+        { name: "ok", backend: "Real" },
+      ],
+    });
+    // a→b→a is a cycle, must surface as error rather than hang.
+    assert.strictEqual(arr, null);
+    assert.ok(errors.length > 0);
   });
 });
