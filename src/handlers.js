@@ -166,6 +166,56 @@ function injectStreamOptions(bodyStr) {
   return bodyStr;
 }
 
+/**
+ * Claude Code can replay tool-search/tool-reference history where a
+ * `tool_result.content[]` block has `{type:"tool_reference"}` but omits the
+ * required `tool_name`. Anthropic-compatible validators reject that with
+ * `tool_result.content.0.tool_reference.tool_name: Field required`.
+ *
+ * The missing value is recoverable from the matching prior assistant
+ * `tool_use` block: `tool_result.tool_use_id` points at `tool_use.id`, whose
+ * `name` is exactly the required `tool_name`.
+ */
+function normalizeAnthropicToolReferences(body) {
+  if (!body || typeof body !== "object" || !Array.isArray(body.messages)) return body;
+
+  const toolNameByUseId = new Map();
+  for (const msg of body.messages) {
+    if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (block && block.type === "tool_use" && block.id && block.name) {
+        toolNameByUseId.set(block.id, block.name);
+      }
+    }
+  }
+
+  const fallbackToolName = Array.isArray(body.tools) && body.tools.length === 1 && body.tools[0]?.name
+    ? body.tools[0].name
+    : "";
+
+  for (const msg of body.messages) {
+    if (!msg || msg.role !== "user" || !Array.isArray(msg.content)) continue;
+    for (const result of msg.content) {
+      if (!result || result.type !== "tool_result" || !Array.isArray(result.content)) continue;
+      const inferredName = toolNameByUseId.get(result.tool_use_id) || fallbackToolName;
+      if (!inferredName) continue;
+
+      for (const part of result.content) {
+        if (!part || part.type !== "tool_reference") continue;
+        if (typeof part.tool_name !== "string" || part.tool_name.length === 0) {
+          part.tool_name = inferredName;
+        }
+        if (part.tool_reference && typeof part.tool_reference === "object" &&
+            (typeof part.tool_reference.tool_name !== "string" || part.tool_reference.tool_name.length === 0)) {
+          part.tool_reference.tool_name = inferredName;
+        }
+      }
+    }
+  }
+
+  return body;
+}
+
 
 /**
  * Wire a client-disconnect hook onto `res`. When the client closes the TCP
@@ -588,13 +638,22 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
   const upstreamUrl = new URL(fullUrl);
   if (upstreamUrl.searchParams.has("beta")) upstreamUrl.searchParams.delete("beta");
 
-  const bodyBuf = bodyStr ? Buffer.from(bodyStr) : undefined;
-  if (bodyBuf && typeof ctx.attachBody === "function") ctx.attachBody(bodyBuf);
-
-  let isStream = false;
+  let normalizedBodyStr = bodyStr;
   if (bodyStr) {
     try {
       const parsed = JSON.parse(bodyStr);
+      normalizeAnthropicToolReferences(parsed);
+      normalizedBodyStr = JSON.stringify(parsed);
+    } catch {}
+  }
+
+  const bodyBuf = normalizedBodyStr ? Buffer.from(normalizedBodyStr) : undefined;
+  if (bodyBuf && typeof ctx.attachBody === "function") ctx.attachBody(bodyBuf);
+
+  let isStream = false;
+  if (normalizedBodyStr) {
+    try {
+      const parsed = JSON.parse(normalizedBodyStr);
       isStream = parsed.stream === true;
     } catch {}
   }
@@ -726,6 +785,7 @@ module.exports = {
   proxyRequest,
   // exposed for unit tests
   _injectStreamOptions: injectStreamOptions,
+  _normalizeAnthropicToolReferences: normalizeAnthropicToolReferences,
   // exposed for other handler modules
   _relayUpstreamErrorBody: relayUpstreamErrorBody,
   _sendUpstreamError: sendUpstreamError,

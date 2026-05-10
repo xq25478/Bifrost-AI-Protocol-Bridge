@@ -15,6 +15,7 @@ const { json } = require("./src/http_utils");
 const {
   proxyOpenAIChat, proxyAnthropicAsOpenAI,
   proxyOpenAIDirect, proxyRequest,
+  _normalizeAnthropicToolReferences: normalizeAnthropicToolReferences,
 } = require("./src/handlers");
 const {
   proxyResponsesAsOpenAI, proxyResponsesAsAnthropic,
@@ -274,6 +275,7 @@ const server = http.createServer((req, res) => {
       parsedBody.model = backendModelId;
 
       normalizeThinking(parsedBody, backend);
+      normalizeAnthropicToolReferences(parsedBody);
 
       if (backend.type !== "anthropic") {
         ctx.end(501, { backend: backend.provider, model: modelId, msg: "count_tokens unsupported" });
@@ -451,6 +453,7 @@ const server = http.createServer((req, res) => {
 
       parsedBody.model = backendModelId;
       normalizeThinking(parsedBody, backend);
+      normalizeAnthropicToolReferences(parsedBody);
 
       ctx.on("route", { backend: backend.provider, model: modelId, upstream_model: backendModelId });
 

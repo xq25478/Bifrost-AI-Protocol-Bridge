@@ -4,7 +4,10 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 
-const { _injectStreamOptions: injectStreamOptions } = require("./handlers");
+const {
+  _injectStreamOptions: injectStreamOptions,
+  _normalizeAnthropicToolReferences: normalizeAnthropicToolReferences,
+} = require("./handlers");
 
 describe("handlers - injectStreamOptions", () => {
   it("adds include_usage when stream=true and stream_options absent", () => {
@@ -147,6 +150,73 @@ describe("handlers - Anthropic passthrough headers", () => {
     } finally {
       restore();
     }
+  });
+
+  it("fills missing tool_reference.tool_name from matching tool_use before passthrough", async () => {
+    const upstream = new EventEmitter();
+    const { handlers, captured, restore } = loadHandlersCapturingUpstream(upstream);
+    try {
+      const req = {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": "tool-search-2025-10-19",
+        },
+      };
+      const res = makeFakeRes();
+      const ctx = makeCtx();
+      const backendCfg = {
+        provider: "P",
+        baseUrl: "http://upstream.example/anthropic",
+        apiKey: "sk-upstream",
+        type: "anthropic",
+      };
+      const body = JSON.stringify({
+        model: "claude",
+        max_tokens: 8,
+        tools: [{ name: "Edit", defer_loading: true, input_schema: { type: "object", properties: {} } }],
+        messages: [
+          { role: "assistant", content: [{ type: "tool_use", id: "toolu_edit", name: "Edit", input: {} }] },
+          { role: "user", content: [{
+            type: "tool_result",
+            tool_use_id: "toolu_edit",
+            content: [
+              { type: "tool_reference" },
+              { type: "tool_reference", tool_reference: {} },
+            ],
+          }] },
+        ],
+      });
+
+      await handlers.proxyRequest(req, res, ctx, backendCfg, "/anthropic/v1/messages", body);
+      const forwarded = JSON.parse(captured().options.body.toString("utf8"));
+      const resultContent = forwarded.messages[1].content[0].content;
+      assert.strictEqual(resultContent[0].tool_name, "Edit");
+      assert.strictEqual(resultContent[1].tool_name, "Edit");
+      assert.strictEqual(resultContent[1].tool_reference.tool_name, "Edit");
+
+      upstream.emit("data", Buffer.from("{}"));
+      upstream.emit("end");
+      await res._endedPromise;
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("handlers - normalizeAnthropicToolReferences", () => {
+  it("uses the sole top-level tool as fallback when history lacks the tool_use", () => {
+    const body = {
+      tools: [{ name: "Read", defer_loading: true }],
+      messages: [{ role: "user", content: [{
+        type: "tool_result",
+        tool_use_id: "missing",
+        content: [{ type: "tool_reference" }],
+      }] }],
+    };
+    normalizeAnthropicToolReferences(body);
+    assert.strictEqual(body.messages[0].content[0].content[0].tool_name, "Read");
   });
 });
 
