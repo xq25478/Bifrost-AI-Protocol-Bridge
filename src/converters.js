@@ -57,39 +57,32 @@ function anthropicBodyToOpenAIChat(body, backend) {
     messages.push({ role: "system", content: body.system.map(s => s.type === "text" ? s.text : JSON.stringify(s)).join("\n") });
   }
   for (const msg of body.messages || []) {
+    // Anthropic spec only emits role:"user" or role:"assistant" in messages[];
+    // anything else (system/developer/tool, or accidental Responses leakage)
+    // is unknown to a Chat-format backend. Downgrade to "user" rather than
+    // forwarding a role the downstream may reject. The Anthropic-side
+    // `system` field is handled separately above.
+    const inRole = (msg.role === "assistant" || msg.role === "user") ? msg.role : "user";
     if (typeof msg.content === "string") {
-      messages.push({ role: msg.role, content: msg.content });
+      messages.push({ role: inRole, content: msg.content });
       continue;
     }
     if (!Array.isArray(msg.content)) {
-      messages.push({ role: msg.role, content: "" });
+      messages.push({ role: inRole, content: "" });
       continue;
     }
-    const toolResults = [];
-    const rest = [];
-    for (const c of msg.content) {
-      if (c.type === "tool_result") {
-        // Anthropic allows `tool_result.content` to be a string OR an array of
-        // content blocks ({type:"text"} / {type:"image"}). Collapse to a plain
-        // string when possible (Chat's conventional shape); if it carries
-        // images, keep the structured array so the image survives the hop.
-        const flat = toolResultContentToChat(c.content);
-        const tc = {
-          role: "tool",
-          tool_call_id: c.tool_use_id || "",
-          content: flat
-        };
-        if (c.is_error) {
-          if (typeof tc.content === "string") tc.content = "[ERROR] " + tc.content;
-          else tc.content = [{ type: "text", text: "[ERROR]" }, ...(Array.isArray(tc.content) ? tc.content : [])];
-        }
-        messages.push(tc);
-      } else {
-        rest.push(c);
-      }
-    }
-    if (rest.length > 0) {
-      if (msg.role === "assistant") {
+    // Walk the content array preserving block order. Anthropic allows
+    // `tool_result` blocks to be interleaved with `text`/`image` blocks
+    // inside a single user turn; the previous implementation pushed all
+    // tool_results before all non-tool blocks, silently reordering the
+    // conversation. We now flush a pending `rest` buffer into a user
+    // message every time we hit a tool_result, so the resulting Chat
+    // message order mirrors the original Anthropic block order.
+    if (inRole === "assistant") {
+      // assistant-side: filter out tool_result (illegal per Anthropic, but
+      // tolerate) and fold the rest into the existing assistant builder.
+      const rest = msg.content.filter(c => c && c.type !== "tool_result");
+      if (rest.length > 0) {
         const textParts = [];
         const thinkingParts = [];
         const toolParts = [];
@@ -115,30 +108,60 @@ function anthropicBodyToOpenAIChat(body, backend) {
         if (thinkingContent) am.reasoning_content = thinkingContent;
         if (toolParts.length > 0) am.tool_calls = toolParts;
         messages.push(am);
-      } else {
-        const parts = [];
-        for (const c of rest) {
-          if (c.type === "text") parts.push(c.text);
-          else if (c.type === "image") {
-            if (c.source?.type === "base64") {
-              parts.push({ type: "image_url", image_url: { url: "data:" + c.source.media_type + ";base64," + c.source.data } });
-            } else if (c.source?.type === "url") {
-              parts.push({ type: "image_url", image_url: { url: c.source.url } });
-            }
-          } else if (c.type === "tool_use") {
-            parts.push({ type: "text", text: "[tool_use: " + (c.name || "") + " " + JSON.stringify(c.input || {}) + "]" });
-          } else {
-            parts.push(c.text || JSON.stringify(c));
-          }
-        }
-        if (parts.length === 0) { messages.push({ role: msg.role, content: "" }); continue; }
-        if (parts.every(p => typeof p === "string")) {
-          messages.push({ role: msg.role, content: parts.join("") });
-        } else {
-          const contentArr = parts.map(p => typeof p === "string" ? { type: "text", text: p } : p);
-          messages.push({ role: msg.role, content: contentArr });
-        }
       }
+    } else {
+      // user-side: walk in order. `tool_result` becomes a `role:tool`
+      // message; buffered text/image blocks before each tool_result are
+      // flushed as a `role:user` message first to preserve order.
+      let userBuf = [];
+      const flushUser = () => {
+        if (userBuf.length === 0) return;
+        if (userBuf.every(p => typeof p === "string")) {
+          messages.push({ role: "user", content: userBuf.join("") });
+        } else {
+          const arr = userBuf.map(p => typeof p === "string" ? { type: "text", text: p } : p);
+          messages.push({ role: "user", content: arr });
+        }
+        userBuf = [];
+      };
+      for (const c of msg.content) {
+        if (!c || typeof c !== "object") continue;
+        if (c.type === "tool_result") {
+          flushUser();
+          // Anthropic allows `tool_result.content` to be a string OR an
+          // array of content blocks ({type:"text"} / {type:"image"}).
+          // Collapse to a plain string when possible (Chat's conventional
+          // shape); if it carries images, keep the structured array so
+          // the image survives the hop.
+          const flat = toolResultContentToChat(c.content);
+          const tc = {
+            role: "tool",
+            tool_call_id: c.tool_use_id || "",
+            content: flat,
+          };
+          if (c.is_error) {
+            if (typeof tc.content === "string") tc.content = "[ERROR] " + tc.content;
+            else tc.content = [{ type: "text", text: "[ERROR]" }, ...(Array.isArray(tc.content) ? tc.content : [])];
+          }
+          messages.push(tc);
+          continue;
+        }
+        if (c.type === "text") { userBuf.push(c.text); continue; }
+        if (c.type === "image") {
+          if (c.source?.type === "base64") {
+            userBuf.push({ type: "image_url", image_url: { url: "data:" + c.source.media_type + ";base64," + c.source.data } });
+          } else if (c.source?.type === "url") {
+            userBuf.push({ type: "image_url", image_url: { url: c.source.url } });
+          }
+          continue;
+        }
+        if (c.type === "tool_use") {
+          userBuf.push({ type: "text", text: "[tool_use: " + (c.name || "") + " " + JSON.stringify(c.input || {}) + "]" });
+          continue;
+        }
+        userBuf.push(c.text || JSON.stringify(c));
+      }
+      flushUser();
     }
   }
 

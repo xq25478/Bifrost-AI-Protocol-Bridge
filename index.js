@@ -73,6 +73,66 @@ function buildDashboardBody(searchParams) {
   return body;
 }
 
+/**
+ * Deterministic local approximation of Anthropic's `count_tokens` response.
+ * Used when:
+ *   - the routed backend speaks OpenAI (no native count_tokens), or
+ *   - the Anthropic upstream returns 4xx/5xx/non-JSON (account / quota
+ *     issues at the upstream gateway, regional rollout gaps, etc.)
+ *
+ * The heuristic is the well-known "1 token ≈ 4 characters of English text"
+ * rule with structural blocks contributing their JSON-stringified length.
+ * It is intentionally a SLIGHT over-estimate so callers that pre-check
+ * limits before making the real request stay on the safe side.
+ */
+function estimateAnthropicTokens(body) {
+  if (!body || typeof body !== "object") return 0;
+  let chars = 0;
+  const sys = body.system;
+  if (typeof sys === "string") chars += sys.length;
+  else if (Array.isArray(sys)) {
+    for (const s of sys) {
+      if (s && typeof s === "object" && typeof s.text === "string") chars += s.text.length;
+    }
+  }
+  if (Array.isArray(body.messages)) {
+    for (const m of body.messages) {
+      if (!m) continue;
+      const c = m.content;
+      if (typeof c === "string") { chars += c.length; continue; }
+      if (!Array.isArray(c)) continue;
+      for (const b of c) {
+        if (!b || typeof b !== "object") continue;
+        if (b.type === "text" && typeof b.text === "string") { chars += b.text.length; continue; }
+        if (b.type === "thinking" && typeof b.thinking === "string") { chars += b.thinking.length; continue; }
+        if (b.type === "tool_use") {
+          chars += (b.name || "").length;
+          try { chars += JSON.stringify(b.input || {}).length; } catch {}
+          continue;
+        }
+        if (b.type === "tool_result") {
+          if (typeof b.content === "string") chars += b.content.length;
+          else if (Array.isArray(b.content)) {
+            for (const p of b.content) {
+              if (p && p.type === "text" && typeof p.text === "string") chars += p.text.length;
+            }
+          }
+          continue;
+        }
+      }
+    }
+  }
+  if (Array.isArray(body.tools)) {
+    for (const t of body.tools) {
+      if (!t) continue;
+      chars += (t.name || "").length + (t.description || "").length;
+      try { chars += JSON.stringify(t.input_schema || {}).length; } catch {}
+    }
+  }
+  // 1 token ≈ 4 chars; round up to bias toward over-estimation.
+  return Math.max(1, Math.ceil(chars / 4));
+}
+
 function requireApiKey(req, res, ctx, backend) {
   if (hasApiKey(req, backend.apiKey)) return true;
   ctx.end(401, { backend: backend.provider, msg: "no api key" });
@@ -273,9 +333,16 @@ const server = http.createServer((req, res) => {
 
       normalizeThinking(parsedBody, backend);
 
+      // Anthropic-only endpoint upstream-wise: when the routed backend speaks
+      // OpenAI, or when the Anthropic upstream rejects count_tokens, we still
+      // want clients (notably Claude Code) to get a numeric answer rather
+      // than a hard 501. Fall back to a deterministic local approximation —
+      // documented as `is_estimate: true` so callers can tell.
       if (backend.type !== "anthropic") {
-        ctx.end(501, { backend: backend.provider, model: modelId, msg: "count_tokens unsupported" });
-        return json(res, 501, { error: { type: "not_implemented", message: `count_tokens is only supported for Anthropic-type backends; model "${modelId}" is routed to ${backend.provider} (${backend.type})` } }, req);
+        const inputTokens = estimateAnthropicTokens(parsedBody);
+        ctx.on("count_tokens", { backend: backend.provider, model: modelId, msg: `input_tokens=${inputTokens} (estimate, non-anthropic backend)` });
+        ctx.end(200, { backend: backend.provider });
+        return json(res, 200, { input_tokens: inputTokens, is_estimate: true }, req);
       }
 
       if (!requireApiKey(req, res, ctx, backend)) return;
@@ -301,10 +368,14 @@ const server = http.createServer((req, res) => {
           up = await doUpstream(upstreamUrl, { method: "POST", headers: upstreamHeaders, body: reqBodyBuf }, backend);
         } catch (err) {
           incMetric("upstream_errors");
-          const status = upstreamErrStatus(err);
-          ctx.err(status, err, { backend: backend.provider });
-          if (res.headersSent) { res.destroy(); return; }
-          return json(res, status, { error: { type: "upstream_error", message: String(err), code: status } }, req);
+          // Upstream transport error — fall back to local estimate rather
+          // than surfacing a 502 for what is otherwise a read-only sizing
+          // call.
+          const inputTokens = estimateAnthropicTokens(parsedBody);
+          system("warn", `count_tokens upstream failed (${String(err)}); using local estimate input_tokens=${inputTokens}`, { backend: backend.provider, rid: ctx.rid });
+          ctx.on("count_tokens", { backend: backend.provider, model: modelId, msg: `input_tokens=${inputTokens} (estimate, upstream error)` });
+          ctx.end(200, { backend: backend.provider });
+          return json(res, 200, { input_tokens: inputTokens, is_estimate: true }, req);
         }
 
         const { statusCode, body: upstreamBody, finish } = up;
@@ -313,14 +384,28 @@ const server = http.createServer((req, res) => {
         upstreamBody.on("data", chunk => { chunks.push(chunk); totalLen += chunk.length; });
         upstreamBody.on("end", () => {
           const buf = Buffer.concat(chunks, totalLen);
+          // Upstream returned a non-2xx — log the body for diagnosis and
+          // fall back to local estimate.
+          if (statusCode >= 400) {
+            finish();
+            const inputTokens = estimateAnthropicTokens(parsedBody);
+            system("warn", `count_tokens upstream ${statusCode}: ${buf.toString("utf8").slice(0, 500)} — using local estimate input_tokens=${inputTokens}`, { backend: backend.provider, rid: ctx.rid });
+            ctx.on("count_tokens", { backend: backend.provider, model: modelId, msg: `input_tokens=${inputTokens} (estimate, upstream ${statusCode})` });
+            ctx.end(200, { backend: backend.provider });
+            if (res.headersSent) { res.destroy(); return; }
+            return json(res, 200, { input_tokens: inputTokens, is_estimate: true }, req);
+          }
           let parsedResp;
           try {
             parsedResp = JSON.parse(buf.toString("utf8"));
           } catch {
-            ctx.err(502, new Error("invalid upstream response"), { backend: backend.provider });
             finish();
+            const inputTokens = estimateAnthropicTokens(parsedBody);
+            system("warn", `count_tokens upstream returned non-JSON; using local estimate input_tokens=${inputTokens}`, { backend: backend.provider, rid: ctx.rid });
+            ctx.on("count_tokens", { backend: backend.provider, model: modelId, msg: `input_tokens=${inputTokens} (estimate, non-JSON)` });
+            ctx.end(200, { backend: backend.provider });
             if (res.headersSent) { res.destroy(); return; }
-            return json(res, 502, { error: { type: "upstream_error", message: "Invalid count_tokens response from upstream" } }, req);
+            return json(res, 200, { input_tokens: inputTokens, is_estimate: true }, req);
           }
           const inputTokens = typeof parsedResp.input_tokens === "number" ? parsedResp.input_tokens : 0;
           ctx.on("count_tokens", { backend: backend.provider, model: modelId, msg: `input_tokens=${inputTokens}` });
@@ -331,10 +416,17 @@ const server = http.createServer((req, res) => {
         upstreamBody.on("error", err => {
           finish();
           incMetric("upstream_errors");
-          const status = upstreamErrStatus(err);
-          ctx.err(status, err, { backend: backend.provider });
-          if (res.headersSent) { res.destroy(); return; }
-          return json(res, status, { error: { type: "upstream_error", message: String(err), code: status } }, req);
+          // Mid-body error: if headers haven't gone out yet, fall back to
+          // estimate; otherwise just destroy (partial JSON is unrecoverable).
+          if (!res.headersSent) {
+            const inputTokens = estimateAnthropicTokens(parsedBody);
+            system("warn", `count_tokens upstream stream errored (${String(err)}); using local estimate input_tokens=${inputTokens}`, { backend: backend.provider, rid: ctx.rid });
+            ctx.on("count_tokens", { backend: backend.provider, model: modelId, msg: `input_tokens=${inputTokens} (estimate, stream error)` });
+            ctx.end(200, { backend: backend.provider });
+            return json(res, 200, { input_tokens: inputTokens, is_estimate: true }, req);
+          }
+          ctx.err(upstreamErrStatus(err), err, { backend: backend.provider });
+          res.destroy();
         });
       })();
       return;

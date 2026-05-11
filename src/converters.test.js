@@ -160,6 +160,46 @@ describe("anthropicBodyToOpenAIChat", () => {
     assert.strictEqual(result.chat_template_kwargs, undefined);
     assert.strictEqual(result.reasoning_effort, undefined);
   });
+
+  it("preserves block order: text → tool_result → text within one user turn", () => {
+    // Previously all tool_result blocks were emitted before any text/image
+    // blocks of the same user message, silently reordering the conversation.
+    // The converted Chat sequence must mirror the original block order.
+    const result = anthropicBodyToOpenAIChat({
+      model: "m", max_tokens: 100,
+      messages: [
+        { role: "assistant", content: [
+          { type: "tool_use", id: "tu_1", name: "search", input: { q: "x" } },
+        ]},
+        { role: "user", content: [
+          { type: "text", text: "before" },
+          { type: "tool_result", tool_use_id: "tu_1", content: "result" },
+          { type: "text", text: "after" },
+        ]},
+      ],
+    });
+    // assistant turn with tool_calls, then user "before", then tool result,
+    // then user "after" — block order preserved.
+    assert.strictEqual(result.messages[0].role, "assistant");
+    assert.strictEqual(result.messages[1].role, "user");
+    assert.strictEqual(result.messages[1].content, "before");
+    assert.strictEqual(result.messages[2].role, "tool");
+    assert.strictEqual(result.messages[2].content, "result");
+    assert.strictEqual(result.messages[3].role, "user");
+    assert.strictEqual(result.messages[3].content, "after");
+  });
+
+  it("downgrades unknown roles to user", () => {
+    // Anthropic messages[] is supposed to contain only user/assistant;
+    // anything else (an accidental Responses leakage or a buggy client)
+    // must not be forwarded as a non-standard role to a Chat backend.
+    const result = anthropicBodyToOpenAIChat({
+      model: "m", max_tokens: 100,
+      messages: [{ role: "developer", content: "be terse" }],
+    });
+    assert.strictEqual(result.messages[0].role, "user");
+    assert.strictEqual(result.messages[0].content, "be terse");
+  });
 });
 
 describe("openaiChatResponseToAnthropic", () => {
