@@ -1,5 +1,7 @@
 "use strict";
 
+const { DEFAULT_MAX_TOKENS } = require("./config");
+
 const crypto = require("crypto");
 const { normalizeUsage } = require("./usage_recorder");
 const { budgetToEffort, effortToBudget } = require("./thinking");
@@ -168,7 +170,7 @@ function anthropicBodyToOpenAIChat(body, backend) {
   const req = {
     model: body.model,
     messages,
-    max_tokens: body.max_tokens || 4096,
+    max_tokens: (typeof body.max_tokens === "number" && body.max_tokens > 0) ? body.max_tokens : DEFAULT_MAX_TOKENS,
     stream: body.stream === true
   };
   if (req.stream) req.stream_options = { include_usage: true };
@@ -691,7 +693,7 @@ function openaiBodyToAnthropic(body) {
     i += 1;
   }
 
-  const req = { model: body.model, messages, max_tokens: body.max_tokens || 4096 };
+  const req = { model: body.model, messages, max_tokens: (typeof body.max_tokens === "number" && body.max_tokens > 0) ? body.max_tokens : DEFAULT_MAX_TOKENS };
   if (systemParts.length > 0) req.system = systemParts.join("\n\n");
   if (body.stream !== undefined) req.stream = body.stream;
   if (body.temperature !== undefined) req.temperature = body.temperature;

@@ -30,6 +30,16 @@ const HOP_BY_HOP = new Set([
   "te", "trailer", "upgrade"
 ]);
 
+// Default `max_tokens` we send upstream when the client didn't supply one.
+// Many CLIs (e.g. Codex via the Anthropic adapter) omit `max_tokens` even
+// though Anthropic requires it; the previous hard-coded 4096 was small enough
+// that long answers got truncated with finish_reason=length / stop_reason=
+// max_tokens. Override via env (PROXY_MAX_TOKENS_DEFAULT) when needed.
+const DEFAULT_MAX_TOKENS = (() => {
+  const raw = parseInt(process.env.PROXY_MAX_TOKENS_DEFAULT || "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 32768;
+})();
+
 const DEFAULT_THINKING_EFFORT = "max";
 const SUPPORTED_THINKING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
@@ -66,6 +76,7 @@ module.exports = {
   LOCAL_HEADERS_TIMEOUT,
   BACKENDS_PATH,
   HOP_BY_HOP,
+  DEFAULT_MAX_TOKENS,
   DEFAULT_THINKING_EFFORT,
   SUPPORTED_THINKING_EFFORTS,
   SHUTDOWN_DRAIN_MS,

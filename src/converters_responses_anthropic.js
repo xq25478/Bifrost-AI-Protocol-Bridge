@@ -1,5 +1,7 @@
 "use strict";
 
+const { DEFAULT_MAX_TOKENS } = require("./config");
+
 /**
  * Direct OpenAI Responses API <-> Anthropic Messages conversions.
  *
@@ -268,7 +270,7 @@ function responsesBodyToAnthropic(body) {
   const out = {
     model: body.model,
     messages,
-    max_tokens: typeof body.max_output_tokens === "number" ? body.max_output_tokens : 4096,
+    max_tokens: (typeof body.max_output_tokens === "number" && body.max_output_tokens > 0) ? body.max_output_tokens : DEFAULT_MAX_TOKENS,
   };
   if (systemParts.length > 0) out.system = systemParts.join("\n\n");
   if (typeof body.stream === "boolean") out.stream = body.stream;
