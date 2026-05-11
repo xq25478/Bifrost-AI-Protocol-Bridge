@@ -1063,7 +1063,12 @@ describe("openaiBodyToAnthropic - reasoning round-trip", () => {
 
   it("Chat reasoning_effort → Anthropic thinking with matching budget", () => {
     const out = openaiBodyToAnthropic({
-      model: "m", messages: [{ role: "user", content: "hi" }], reasoning_effort: "high"
+      // Provide a max_tokens generous enough that the synthesized budget
+      // (effortToBudget("high")=16384) plus answer-room still fits, so the
+      // guard does not clamp or drop it. This test specifically verifies the
+      // effort → budget mapping, not the guard.
+      model: "m", messages: [{ role: "user", content: "hi" }], reasoning_effort: "high",
+      max_tokens: 32000
     });
     assert.ok(out.thinking);
     assert.strictEqual(out.thinking.type, "enabled");
@@ -1073,9 +1078,35 @@ describe("openaiBodyToAnthropic - reasoning round-trip", () => {
   it("chat_template_kwargs.enable_thinking → Anthropic thinking", () => {
     const out = openaiBodyToAnthropic({
       model: "m", messages: [{ role: "user", content: "hi" }],
+      // Generous max_tokens for the same reason as the reasoning_effort test.
+      max_tokens: 32000,
       chat_template_kwargs: { enable_thinking: true, thinking_budget: 4096 }
     });
     assert.deepStrictEqual(out.thinking, { type: "enabled", budget_tokens: 4096 });
+  });
+
+  it("thinking budget guard: clamps budget below max_tokens when conflict", () => {
+    // Synthesizes budget = 16384 (effort=high) > max_tokens = 8000 → guard
+    // should reduce budget to max_tokens - 256 = 7744 so Anthropic accepts.
+    const out = openaiBodyToAnthropic({
+      model: "m", messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "high", max_tokens: 8000
+    });
+    assert.ok(out.thinking);
+    assert.strictEqual(out.thinking.type, "enabled");
+    assert.ok(out.thinking.budget_tokens < out.max_tokens, "budget must be strictly less than max_tokens");
+    assert.ok(out.thinking.budget_tokens >= 1024, "budget must remain >= 1024");
+  });
+
+  it("thinking budget guard: drops thinking when max_tokens too small for a valid budget", () => {
+    // max_tokens = 800: even after clamping to max_tokens - 256 = 544 the
+    // result is < 1024, so Anthropic will reject any thinking config.
+    // The guard must drop the `thinking` block entirely.
+    const out = openaiBodyToAnthropic({
+      model: "m", messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "high", max_tokens: 800
+    });
+    assert.strictEqual(out.thinking, undefined);
   });
 
   it("Chat parallel_tool_calls:false → Anthropic tool_choice.disable_parallel_tool_use", () => {

@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("crypto");
+const { PassThrough } = require("stream");
 const {
   anthropicBodyToOpenAIChat,
   openaiChatResponseToAnthropic,
@@ -170,7 +171,12 @@ function attachClientDisconnect(res, ctx, abort) {
  * timer. The heartbeat also stops automatically when `res` closes.
  */
 function startSSEHeartbeat(res, intervalMs = 15_000) {
-  let lastActivity = Date.now();
+  // Initialize so the very first scheduled tick fires a heartbeat immediately
+  // (rather than waiting a full intervalMs of silence first). This matters
+  // when an intermediate proxy / browser closes idle SSE connections at a
+  // threshold close to intervalMs — without an opening heartbeat the connection
+  // can be torn down before the upstream produces its first byte.
+  let lastActivity = Date.now() - intervalMs;
   let stopped = false;
   const tick = () => {
     if (stopped) return;
@@ -198,6 +204,34 @@ function ctxMeta(ctx, backend, model, stream, endpoint, clientFormat) {
     stream: stream ? 1 : 0,
     duration_ms: Date.now() - ctx._start,
   };
+}
+
+/**
+ * Sidecar SSE consumer used by passthrough paths. We pipe `upstreamBody`
+ * verbatim into `res` (preserving every SSE byte and event boundary) while
+ * cloning the same chunks into a PassThrough that runs a parser purely for
+ * token-usage extraction. This avoids the historical hazard of re-emitting
+ * SSE lines manually with hand-rolled `\n` separators, where any change in
+ * the line splitter would silently break event grouping.
+ *
+ * `onLine(lineBuf)` runs once per SSE line (Buffer, no trailing CR/LF). The
+ * caller is responsible for parsing `data:`/`event:` and accumulating usage.
+ * Errors thrown from `onLine` are swallowed so a malformed upstream chunk
+ * cannot poison the response pipe.
+ */
+function teeUsageWatcher(upstreamBody, onLine) {
+  const tap = new PassThrough();
+  upstreamBody.on("data", chunk => { try { tap.write(chunk); } catch {} });
+  upstreamBody.on("end", () => { try { tap.end(); } catch {} });
+  upstreamBody.on("error", () => { try { tap.destroy(); } catch {} });
+  const parser = createSSEParser();
+  tap.on("data", chunk => {
+    parser.feed(chunk, line => { try { onLine(line); } catch {} });
+  });
+  tap.on("end", () => {
+    parser.flush(line => { try { onLine(line); } catch {} });
+  });
+  return tap;
 }
 
 async function proxyOpenAIChat(req, res, ctx, backend, body) {
@@ -280,7 +314,6 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
       // would silently drop the last SSE event, which can manifest as the
       // last sentence / finish_reason being lost ("output cut short").
       parser.flush(line => {
-        const s = line.toString("utf8");
         if (!isSSEDataLine(line)) return;
         const d = sseDataPayload(line);
         if (!d) return;
@@ -525,46 +558,45 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
   attachClientDisconnect(res, ctx, abort);
 
   if (isStream) {
-    const parser = createSSEParser();
-    let acc = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
+    // Passthrough path: forward upstream SSE bytes verbatim (via .pipe) so
+    // every event boundary / blank line / trailing newline arrives exactly
+    // as the backend sent it. A sidecar parser taps the same stream to
+    // extract usage without touching the on-the-wire bytes.
+    const acc = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
     const heartbeat = startSSEHeartbeat(res);
+    let ttftMarked = false;
+
+    teeUsageWatcher(upstreamBody, line => {
+      if (!isSSEDataLine(line)) return;
+      const d = sseDataPayload(line);
+      if (!d || d === "[DONE]") return;
+      try {
+        const chunkObj = JSON.parse(d);
+        if (chunkObj.usage) {
+          const u = normalizeUsage(chunkObj.usage);
+          if (typeof u.input_tokens === "number") acc.input_tokens = u.input_tokens;
+          if (typeof u.output_tokens === "number") acc.output_tokens = u.output_tokens;
+          if (typeof u.cache_read_tokens === "number") acc.cache_read_tokens = u.cache_read_tokens;
+          if (typeof u.cache_write_tokens === "number") acc.cache_write_tokens = u.cache_write_tokens;
+        }
+      } catch {}
+    });
 
     upstreamBody.on("data", chunk => {
-      if (typeof ctx.markTTFT === "function") ctx.markTTFT();
-      const outs = [];
-      parser.feed(chunk, line => {
-        if (isSSEDataLine(line)) {
-          const d = sseDataPayload(line);
-          if (d && d !== "[DONE]") {
-            try {
-              const chunkObj = JSON.parse(d);
-              if (chunkObj.usage) {
-                const u = normalizeUsage(chunkObj.usage);
-                if (u.input_tokens > 0) acc.input_tokens = u.input_tokens;
-                if (u.output_tokens > 0) acc.output_tokens = u.output_tokens;
-                if (u.cache_read_tokens > 0) acc.cache_read_tokens = u.cache_read_tokens;
-                if (u.cache_write_tokens > 0) acc.cache_write_tokens = u.cache_write_tokens;
-              }
-            } catch {}
-          }
-        }
-        outs.push(line.toString("utf8") + "\n");
-      });
-      if (outs.length > 0) { res.write(outs.join("")); heartbeat.touch(); }
+      if (!ttftMarked && typeof ctx.markTTFT === "function") { ctx.markTTFT(); ttftMarked = true; }
+      // Forward the upstream chunk verbatim — no line-splitting, no manual
+      // newline reconstruction. This preserves every SSE boundary byte the
+      // backend produced.
+      try { res.write(chunk); heartbeat.touch(); } catch {}
     });
     upstreamBody.on("end", () => {
-      parser.flush(line => { res.write(line.toString("utf8") + "\n"); });
-      // SSE requires the final event to terminate with a blank line. When
-      // upstream does not end on a trailing newline, append one so strict
-      // SSE parsers treat the stream as completed instead of pending.
-      res.write("\n");
       heartbeat.stop();
-      res.end();
+      try { res.end(); } catch {}
       if (acc.input_tokens || acc.output_tokens) {
         ctx.attachUsage(acc, {
           model: parsedBody.model || "",
           stream: 1,
-          duration_ms: Date.now() - ctx._start
+          duration_ms: Date.now() - ctx._start,
         });
       }
       ctx.end(statusCode || 502, { backend: backend.provider });
@@ -687,37 +719,28 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
   attachClientDisconnect(res, ctx, abort);
 
   if (isStream) {
-    const parser = createSSEParser();
-    let acc = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, model: "" };
+    // Anthropic-direct passthrough: forward upstream SSE bytes verbatim and
+    // run a sidecar parser over a tee'd copy purely for usage extraction.
+    const acc = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, model: "" };
     const heartbeat = startSSEHeartbeat(res);
+    let ttftMarked = false;
+
+    teeUsageWatcher(upstreamBody, line => {
+      parseAnthropicSSEUsage(line.toString("utf8"), acc);
+    });
 
     upstreamBody.on("data", chunk => {
-      if (typeof ctx.markTTFT === "function") ctx.markTTFT();
-      const outs = [];
-      parser.feed(chunk, line => {
-        const s = line.toString("utf8");
-        parseAnthropicSSEUsage(s, acc);
-        outs.push(s + "\n");
-      });
-      if (outs.length > 0) { res.write(outs.join("")); heartbeat.touch(); }
+      if (!ttftMarked && typeof ctx.markTTFT === "function") { ctx.markTTFT(); ttftMarked = true; }
+      try { res.write(chunk); heartbeat.touch(); } catch {}
     });
     upstreamBody.on("end", () => {
-      parser.flush(line => {
-        const s = line.toString("utf8");
-        parseAnthropicSSEUsage(s, acc);
-        res.write(s + "\n");
-      });
-      // SSE requires the final event to terminate with a blank line. When
-      // upstream does not end on a trailing newline, append one so strict
-      // SSE parsers treat the stream as completed instead of pending.
-      res.write("\n");
       heartbeat.stop();
-      res.end();
+      try { res.end(); } catch {}
       if (acc.input_tokens || acc.output_tokens) {
         ctx.attachUsage(acc, {
           model: acc.model || backend.models?.[0] || "",
           stream: 1,
-          duration_ms: Date.now() - ctx._start
+          duration_ms: Date.now() - ctx._start,
         });
       }
       ctx.end(statusCode || 502, { backend: backend.provider });

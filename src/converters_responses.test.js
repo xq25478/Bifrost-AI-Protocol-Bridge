@@ -542,7 +542,12 @@ test("round-trip: Responses reasoning → Chat → Anthropic preserves thinking"
     model: "m",
     input: "hi",
     reasoning: { effort: "high" },
-    max_output_tokens: 500,
+    // Use a max_output_tokens large enough that the synthesized
+    // thinking.budget_tokens (effortToBudget("high") ≈ 8k) plus answer-room
+    // headroom still fits — otherwise the budget guard in openaiBodyToAnthropic
+    // legitimately drops the thinking block. The test wants to verify that
+    // the effort routing path produces a `thinking` block at all.
+    max_output_tokens: 16000,
   });
   assert.strictEqual(chat.reasoning_effort, "high");
   const anth = openaiBodyToAnthropic(chat);

@@ -728,6 +728,33 @@ function openaiBodyToAnthropic(body) {
     else req.thinking.budget_tokens = effortToBudget("medium");
   }
 
+  // Anthropic enforces `thinking.budget_tokens >= 1024` AND
+  // `max_tokens > thinking.budget_tokens`. When the caller's max_tokens is
+  // small (or unset → defaulted to 4096 above) and we just injected a budget
+  // that violates either rule, clamp before the request leaves the gateway —
+  // otherwise Anthropic / Bedrock returns 400
+  // "max_tokens must be greater than thinking.budget_tokens".
+  //
+  // Strategy:
+  //   - If budget < 1024, raise to 1024.
+  //   - If budget >= max_tokens, lower to max_tokens - 256 (reserves room for
+  //     the answer). If that drop would push budget below 1024, drop the
+  //     `thinking` block entirely — Anthropic doesn't accept `type:"enabled"`
+  //     without a budget, and `adaptive` is a non-portable Bedrock extension.
+  if (req.thinking && typeof req.thinking.budget_tokens === "number") {
+    const MIN_BUDGET = 1024;
+    const ANSWER_ROOM = 256;
+    if (req.thinking.budget_tokens < MIN_BUDGET) req.thinking.budget_tokens = MIN_BUDGET;
+    if (req.thinking.budget_tokens >= req.max_tokens) {
+      const target = req.max_tokens - ANSWER_ROOM;
+      if (target >= MIN_BUDGET) {
+        req.thinking.budget_tokens = target;
+      } else {
+        delete req.thinking;
+      }
+    }
+  }
+
   // Anthropic enforces that every `tool_use` block must be followed by a user
   // message containing a `tool_result` block with a matching `tool_use_id`.
   // Clients (notably Codex and partial-conversation replays) sometimes omit
