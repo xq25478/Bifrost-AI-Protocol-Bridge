@@ -292,7 +292,10 @@ function openaiChatResponseToAnthropic(openaiRes) {
   const usage = usageToAnthropicShape(openaiRes.usage);
 
   return {
-    id: openaiRes.id || "msg_" + crypto.randomUUID(),
+    // Match the compact Anthropic id shape (no dashes, ~24 chars) the rest
+    // of this module already uses for tool / chat ids — purely for log /
+    // replay readability; the value is opaque to clients.
+    id: openaiRes.id || "msg_" + crypto.randomUUID().replace(/-/g, "").slice(0, 24),
     type: "message",
     role: "assistant",
     model: openaiRes.model || "",
@@ -798,6 +801,16 @@ function openaiBodyToAnthropic(body) {
  *
  * Synthesized placeholders carry a neutral, obviously-artificial string so the
  * model can tell the call was dropped rather than completed successfully.
+ *
+ * Note on adjacency: this function intentionally only inspects messages[i+1]
+ * (the "next" user message). By the time the converter chain reaches us,
+ * Responses-only items (`reasoning`, `web_search_call`, etc.) have already
+ * been stripped by responsesBodyToOpenAIChat, and openaiBodyToAnthropic
+ * collapses every contiguous run of role:tool messages into ONE Anthropic
+ * user message. So in practice the next-index lookup is sufficient — but
+ * any future converter that introduces non-message blocks between
+ * assistant→user must update this assumption rather than rely on it
+ * implicitly.
  */
 function reconcileToolUsePairs(messages) {
   if (!Array.isArray(messages)) return;

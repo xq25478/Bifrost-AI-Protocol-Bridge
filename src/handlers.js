@@ -27,12 +27,16 @@ const { createSSEParser, isSSEDataLine, sseDataPayload } = require("./sse");
  * and from `upstreamBody.on("error", ...)` where stream cleanup is needed.
  */
 function sendUpstreamError({ err, ctx, backend, res, req, finish, format }) {
-  if (finish) {
-    finish();
-  }
+  // Order: log first, then release upstream resources. The request-log
+  // entry needs an accurate upstream_ms which the ctx.err call snapshots;
+  // calling finish() first would otherwise pre-close the timing window
+  // shared across every handler ("ctx.end/err before finish()").
   incMetric("upstream_errors");
   const status = upstreamErrStatus(err);
   ctx.err(status, err, { backend: backend.provider });
+  if (finish) {
+    finish();
+  }
   if (res.headersSent) {
     // Headers already sent means we're mid-stream. Emit a protocol-appropriate
     // error event + terminator so the client sees a clean end instead of a
