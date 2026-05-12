@@ -145,6 +145,33 @@ function loadKeysFromFile(file) {
   return out;
 }
 
+/**
+ * Persist a list of {key, weight} entries back to the apiKeysFile. Written
+ * as "<key> <weight>" lines (sorted by key so the file is human-readable).
+ * Service restart will read this file via loadKeysFromFile, making the
+ * scheduler weights durable across restarts.
+ *
+ * Writes are batched: at most one write per 5s, so rapid successive weight
+ * updates (e.g. many parallel 200s) don't thrash the disk.
+ */
+const _saveThrottle = new Map();
+function saveKeysToFile(file, entries) {
+  const base = path.dirname(BACKENDS_PATH);
+  const abs = path.isAbsolute(file) ? file : path.join(base, file);
+  const now = Date.now();
+  const last = _saveThrottle.get(abs) || 0;
+  if (now - last < 5_000) return;
+  _saveThrottle.set(abs, now);
+  const sorted = [...entries].sort((a, b) => a.key.localeCompare(b.key));
+  const lines = sorted.map(e => `${e.key} ${Math.max(1, e.weight)}`);
+  try {
+    fs.writeFileSync(abs, lines.join("\n") + "\n", "utf8");
+  } catch {
+    // Non-critical — weights live in memory and survive a full round of
+    // failures before hitting disk; a lost write is harmless.
+  }
+}
+
 function normalizeConfig(parsed) {
   if (Array.isArray(parsed)) return { arr: parsed, errors: [] };
   if (!parsed || typeof parsed !== "object") {
@@ -210,11 +237,15 @@ function normalizeConfig(parsed) {
       }
     }
     if (keyArr.length === 0) keyArr.push({ key: "", weight: 1 });
+    // Stash apiKeysFile on the key array so resolveApiKey can pass it through
+    // to the scheduler for weight persistence on restart.
+    if (typeof apiKeysFile === "string" && apiKeysFile.trim()) keyArr._keysFile = apiKeysFile.trim();
     byModel.set(model, {
       provider: provider || model,
       type: protocol,
       baseUrl: url,
       apiKey: keyArr,
+      apiKeysFile: (typeof apiKeysFile === "string" && apiKeysFile.trim()) ? apiKeysFile : "",
       thinking_format,
       _upstreamModel: model,
       models: [],
@@ -526,12 +557,12 @@ const MAX_KEY_WEIGHT = 32;
 
 const _keyScheduler = new Map();
 
-function _initState(backendApiKey, backendModel) {
+function _initState(backendApiKey, backendModel, keysFile) {
   const entries = backendApiKey.map(e => {
     const base = Math.max(1, e.weight || 1);
     return { key: e.key, baseWeight: base, weight: base, current: 0, blackoutUntil: 0 };
   });
-  const state = { entries, key: backendModel || "_default" };
+  const state = { entries, key: backendModel || "_default", keysFile: keysFile || "" };
   _keyScheduler.set(state.key, state);
   return state;
 }
@@ -562,14 +593,14 @@ function _resetAllToBase(state) {
   delete state.currentKey;
 }
 
-function _scheduledKey(backendApiKey, backendModel) {
+function _scheduledKey(backendApiKey, backendModel, keysFile) {
   if (typeof backendApiKey === "string") return backendApiKey;
   if (!Array.isArray(backendApiKey) || backendApiKey.length === 0) return "";
   if (backendApiKey.length === 1) return backendApiKey[0].key;
 
   const skedKey = backendModel || "_default";
   let state = _keyScheduler.get(skedKey);
-  if (!state) state = _initState(backendApiKey, backendModel);
+  if (!state) state = _initState(backendApiKey, backendModel, keysFile);
   else _refreshState(state, backendApiKey);
 
   const now = Date.now();
@@ -645,6 +676,10 @@ function recordKeyOutcome(backendModel, apiKey, status) {
     entry.weight = Math.max(0, entry.weight - 1);
     if (state.currentKey === apiKey) delete state.currentKey;
   }
+  // Persist weights to the apiKeysFile if configured, so they survive restart.
+  if (state.keysFile && entry.baseWeight > 0) {
+    saveKeysToFile(state.keysFile, state.entries);
+  }
   // other 4xx -> no weight change (caller bug, not key bug)
 }
 
@@ -667,7 +702,8 @@ function getKeySchedulerSnapshot() {
 function resolveApiKey(req, backendApiKey, backendModel) {
   // Array-based multi-key -> use weighted round-robin
   if (Array.isArray(backendApiKey)) {
-    const k = _scheduledKey(backendApiKey, backendModel);
+    const keysFile = Array.isArray(backendApiKey) && backendApiKey._keysFile ? backendApiKey._keysFile : "";
+    const k = _scheduledKey(backendApiKey, backendModel, keysFile);
     if (req && k) {
       // Stash the choice on the request so doUpstream / the handler can
       // record an outcome later via recordKeyOutcome().
